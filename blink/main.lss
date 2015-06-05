@@ -1,0 +1,119 @@
+
+main.elf:     file format elf32-avr
+
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+  0 .text         00000062  00000000  00000000  00000074  2**1
+                  CONTENTS, ALLOC, LOAD, READONLY, CODE
+  1 .data         00000000  00800060  00000062  000000d6  2**0
+                  CONTENTS, ALLOC, LOAD, DATA
+  2 .stab         000006cc  00000000  00000000  000000d8  2**2
+                  CONTENTS, READONLY, DEBUGGING
+  3 .stabstr      00000054  00000000  00000000  000007a4  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  4 .comment      00000011  00000000  00000000  000007f8  2**0
+                  CONTENTS, READONLY
+  5 .debug_aranges 00000020  00000000  00000000  00000809  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  6 .debug_info   00000134  00000000  00000000  00000829  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  7 .debug_abbrev 000000d8  00000000  00000000  0000095d  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  8 .debug_line   00000093  00000000  00000000  00000a35  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  9 .debug_frame  00000024  00000000  00000000  00000ac8  2**2
+                  CONTENTS, READONLY, DEBUGGING
+ 10 .debug_str    0000013d  00000000  00000000  00000aec  2**0
+                  CONTENTS, READONLY, DEBUGGING
+ 11 .debug_loc    0000001f  00000000  00000000  00000c29  2**0
+                  CONTENTS, READONLY, DEBUGGING
+ 12 .debug_ranges 00000010  00000000  00000000  00000c48  2**0
+                  CONTENTS, READONLY, DEBUGGING
+
+Disassembly of section .text:
+
+00000000 <__vectors>:
+   0:	12 c0       	rjmp	.+36     	; 0x26 <__ctors_end>
+   2:	19 c0       	rjmp	.+50     	; 0x36 <__bad_interrupt>
+   4:	18 c0       	rjmp	.+48     	; 0x36 <__bad_interrupt>
+   6:	17 c0       	rjmp	.+46     	; 0x36 <__bad_interrupt>
+   8:	16 c0       	rjmp	.+44     	; 0x36 <__bad_interrupt>
+   a:	15 c0       	rjmp	.+42     	; 0x36 <__bad_interrupt>
+   c:	14 c0       	rjmp	.+40     	; 0x36 <__bad_interrupt>
+   e:	13 c0       	rjmp	.+38     	; 0x36 <__bad_interrupt>
+  10:	12 c0       	rjmp	.+36     	; 0x36 <__bad_interrupt>
+  12:	11 c0       	rjmp	.+34     	; 0x36 <__bad_interrupt>
+  14:	10 c0       	rjmp	.+32     	; 0x36 <__bad_interrupt>
+  16:	0f c0       	rjmp	.+30     	; 0x36 <__bad_interrupt>
+  18:	0e c0       	rjmp	.+28     	; 0x36 <__bad_interrupt>
+  1a:	0d c0       	rjmp	.+26     	; 0x36 <__bad_interrupt>
+  1c:	0c c0       	rjmp	.+24     	; 0x36 <__bad_interrupt>
+  1e:	0b c0       	rjmp	.+22     	; 0x36 <__bad_interrupt>
+  20:	0a c0       	rjmp	.+20     	; 0x36 <__bad_interrupt>
+  22:	09 c0       	rjmp	.+18     	; 0x36 <__bad_interrupt>
+  24:	08 c0       	rjmp	.+16     	; 0x36 <__bad_interrupt>
+
+00000026 <__ctors_end>:
+  26:	11 24       	eor	r1, r1
+  28:	1f be       	out	0x3f, r1	; 63
+  2a:	cf e5       	ldi	r28, 0x5F	; 95
+  2c:	d4 e0       	ldi	r29, 0x04	; 4
+  2e:	de bf       	out	0x3e, r29	; 62
+  30:	cd bf       	out	0x3d, r28	; 61
+  32:	02 d0       	rcall	.+4      	; 0x38 <main>
+  34:	14 c0       	rjmp	.+40     	; 0x5e <_exit>
+
+00000036 <__bad_interrupt>:
+  36:	e4 cf       	rjmp	.-56     	; 0x0 <__vectors>
+
+00000038 <main>:
+#include <util/delay.h>			// Einbinden der _delay_ms()-Funktion um Wartezeiten zu erzeugen
+
+int main (void)				// Hauptprogramm, hier startet der Mikrocontroller
+{
+	unsigned char zwischenspeicher;		// Initialisierung
+	DDRB |= (1<<PB2)|(1<<PB3);		
+  38:	87 b3       	in	r24, 0x17	; 23
+  3a:	8c 60       	ori	r24, 0x0C	; 12
+  3c:	87 bb       	out	0x17, r24	; 23
+	PORTB = 0b00000100;
+  3e:	84 e0       	ldi	r24, 0x04	; 4
+  40:	88 bb       	out	0x18, r24	; 24
+	while(1)			// Nie endende Hauptschleife (Endlosschleife)
+	{
+		zwischenspeicher = PORTB;				// Einlesen
+		zwischenspeicher = zwischenspeicher ^ 0b00001100;	// Verarbeiten
+  42:	9c e0       	ldi	r25, 0x0C	; 12
+	unsigned char zwischenspeicher;		// Initialisierung
+	DDRB |= (1<<PB2)|(1<<PB3);		
+	PORTB = 0b00000100;
+	while(1)			// Nie endende Hauptschleife (Endlosschleife)
+	{
+		zwischenspeicher = PORTB;				// Einlesen
+  44:	88 b3       	in	r24, 0x18	; 24
+		zwischenspeicher = zwischenspeicher ^ 0b00001100;	// Verarbeiten
+  46:	89 27       	eor	r24, r25
+		PORTB = zwischenspeicher;				// Ausgeben
+  48:	88 bb       	out	0x18, r24	; 24
+	#else
+		//round up by default
+		__ticks_dc = (uint32_t)(ceil(fabs(__tmp)));
+	#endif
+
+	__builtin_avr_delay_cycles(__ticks_dc);
+  4a:	2f e9       	ldi	r18, 0x9F	; 159
+  4c:	36 e8       	ldi	r19, 0x86	; 134
+  4e:	81 e0       	ldi	r24, 0x01	; 1
+  50:	21 50       	subi	r18, 0x01	; 1
+  52:	30 40       	sbci	r19, 0x00	; 0
+  54:	80 40       	sbci	r24, 0x00	; 0
+  56:	e1 f7       	brne	.-8      	; 0x50 <__SREG__+0x11>
+  58:	00 c0       	rjmp	.+0      	; 0x5a <__SREG__+0x1b>
+  5a:	00 00       	nop
+  5c:	f3 cf       	rjmp	.-26     	; 0x44 <__SREG__+0x5>
+
+0000005e <_exit>:
+  5e:	f8 94       	cli
+
+00000060 <__stop_program>:
+  60:	ff cf       	rjmp	.-2      	; 0x60 <__stop_program>

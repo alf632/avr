@@ -1,0 +1,2096 @@
+   1               		.file	"main.c"
+   2               	__SP_H__ = 0x3e
+   3               	__SP_L__ = 0x3d
+   4               	__SREG__ = 0x3f
+   5               	__tmp_reg__ = 0
+   6               	__zero_reg__ = 1
+   7               		.text
+   8               	.Ltext0:
+   9               		.cfi_sections	.debug_frame
+  10               	.global	__vector_11
+  12               	__vector_11:
+  13               	.LFB1:
+  14               		.file 1 "uart.c"
+   1:uart.c        **** /*************************************************************************
+   2:uart.c        **** Title:    Interrupt UART library with receive/transmit circular buffers
+   3:uart.c        **** Author:   Peter Fleury <pfleury@gmx.ch>   http://jump.to/fleury
+   4:uart.c        **** File:     $Id: uart.c,v 1.12 2014/01/08 21:58:12 peter Exp $
+   5:uart.c        **** Software: AVR-GCC 4.1, AVR Libc 1.4.6 or higher
+   6:uart.c        **** Hardware: any AVR with built-in UART, 
+   7:uart.c        **** License:  GNU General Public License 
+   8:uart.c        ****           
+   9:uart.c        **** DESCRIPTION:
+  10:uart.c        ****     An interrupt is generated when the UART has finished transmitting or
+  11:uart.c        ****     receiving a byte. The interrupt handling routines use circular buffers
+  12:uart.c        ****     for buffering received and transmitted data.
+  13:uart.c        ****     
+  14:uart.c        ****     The UART_RX_BUFFER_SIZE and UART_TX_BUFFER_SIZE variables define
+  15:uart.c        ****     the buffer size in bytes. Note that these variables must be a 
+  16:uart.c        ****     power of 2.
+  17:uart.c        ****     
+  18:uart.c        **** USAGE:
+  19:uart.c        ****     Refere to the header file uart.h for a description of the routines. 
+  20:uart.c        ****     See also example test_uart.c.
+  21:uart.c        **** 
+  22:uart.c        **** NOTES:
+  23:uart.c        ****     Based on Atmel Application Note AVR306
+  24:uart.c        ****                     
+  25:uart.c        **** LICENSE:
+  26:uart.c        ****     Copyright (C) 2006 Peter Fleury
+  27:uart.c        **** 
+  28:uart.c        ****     This program is free software; you can redistribute it and/or modify
+  29:uart.c        ****     it under the terms of the GNU General Public License as published by
+  30:uart.c        ****     the Free Software Foundation; either version 2 of the License, or
+  31:uart.c        ****     any later version.
+  32:uart.c        **** 
+  33:uart.c        ****     This program is distributed in the hope that it will be useful,
+  34:uart.c        ****     but WITHOUT ANY WARRANTY; without even the implied warranty of
+  35:uart.c        ****     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  36:uart.c        ****     GNU General Public License for more details.
+  37:uart.c        ****                         
+  38:uart.c        **** *************************************************************************/
+  39:uart.c        **** #include <avr/io.h>
+  40:uart.c        **** #include <avr/interrupt.h>
+  41:uart.c        **** #include <avr/pgmspace.h>
+  42:uart.c        **** #include "uart.h"
+  43:uart.c        **** 
+  44:uart.c        **** 
+  45:uart.c        **** /*
+  46:uart.c        ****  *  constants and macros
+  47:uart.c        ****  */
+  48:uart.c        **** 
+  49:uart.c        **** /* size of RX/TX buffers */
+  50:uart.c        **** #define UART_RX_BUFFER_MASK ( UART_RX_BUFFER_SIZE - 1)
+  51:uart.c        **** #define UART_TX_BUFFER_MASK ( UART_TX_BUFFER_SIZE - 1)
+  52:uart.c        **** 
+  53:uart.c        **** #if ( UART_RX_BUFFER_SIZE & UART_RX_BUFFER_MASK )
+  54:uart.c        **** #error RX buffer size is not a power of 2
+  55:uart.c        **** #endif
+  56:uart.c        **** #if ( UART_TX_BUFFER_SIZE & UART_TX_BUFFER_MASK )
+  57:uart.c        **** #error TX buffer size is not a power of 2
+  58:uart.c        **** #endif
+  59:uart.c        **** 
+  60:uart.c        **** #if defined(__AVR_AT90S2313__) \
+  61:uart.c        ****  || defined(__AVR_AT90S4414__) || defined(__AVR_AT90S4434__) \
+  62:uart.c        ****  || defined(__AVR_AT90S8515__) || defined(__AVR_AT90S8535__) \
+  63:uart.c        ****  || defined(__AVR_ATmega103__)
+  64:uart.c        ****  /* old AVR classic or ATmega103 with one UART */
+  65:uart.c        ****  #define AT90_UART
+  66:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   UART_RX_vect 
+  67:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  UART_UDRE_vect
+  68:uart.c        ****  #define UART0_STATUS   USR
+  69:uart.c        ****  #define UART0_CONTROL  UCR
+  70:uart.c        ****  #define UART0_DATA     UDR  
+  71:uart.c        ****  #define UART0_UDRIE    UDRIE
+  72:uart.c        **** #elif defined(__AVR_AT90S2333__) || defined(__AVR_AT90S4433__)
+  73:uart.c        ****  /* old AVR classic with one UART */
+  74:uart.c        ****  #define AT90_UART
+  75:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   UART_RX_vect 
+  76:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  UART_UDRE_vect
+  77:uart.c        ****  #define UART0_STATUS   UCSRA
+  78:uart.c        ****  #define UART0_CONTROL  UCSRB
+  79:uart.c        ****  #define UART0_DATA     UDR 
+  80:uart.c        ****  #define UART0_UDRIE    UDRIE
+  81:uart.c        **** #elif  defined(__AVR_ATmega8__) || defined(__AVR_ATmega16__) || defined(__AVR_ATmega32__) \
+  82:uart.c        ****   || defined(__AVR_ATmega323__)
+  83:uart.c        ****   /* ATmega with one USART */
+  84:uart.c        ****  #define ATMEGA_USART
+  85:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART_RXC_vect
+  86:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART_UDRE_vect
+  87:uart.c        ****  #define UART0_STATUS   UCSRA
+  88:uart.c        ****  #define UART0_CONTROL  UCSRB
+  89:uart.c        ****  #define UART0_DATA     UDR
+  90:uart.c        ****  #define UART0_UDRIE    UDRIE
+  91:uart.c        **** #elif defined (__AVR_ATmega8515__) || defined(__AVR_ATmega8535__)
+  92:uart.c        ****  #define ATMEGA_USART
+  93:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART_RX_vect
+  94:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART_UDRE_vect
+  95:uart.c        ****  #define UART0_STATUS   UCSRA
+  96:uart.c        ****  #define UART0_CONTROL  UCSRB
+  97:uart.c        ****  #define UART0_DATA     UDR
+  98:uart.c        ****  #define UART0_UDRIE    UDRIE
+  99:uart.c        **** #elif defined(__AVR_ATmega163__)
+ 100:uart.c        ****   /* ATmega163 with one UART */
+ 101:uart.c        ****  #define ATMEGA_UART
+ 102:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   UART_RX_vect
+ 103:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  UART_UDRE_vect
+ 104:uart.c        ****  #define UART0_STATUS   UCSRA
+ 105:uart.c        ****  #define UART0_CONTROL  UCSRB
+ 106:uart.c        ****  #define UART0_DATA     UDR
+ 107:uart.c        ****  #define UART0_UDRIE    UDRIE
+ 108:uart.c        **** #elif defined(__AVR_ATmega162__) 
+ 109:uart.c        ****  /* ATmega with two USART */
+ 110:uart.c        ****  #define ATMEGA_USART0
+ 111:uart.c        ****  #define ATMEGA_USART1
+ 112:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART0_RXC_vect
+ 113:uart.c        ****  #define UART1_RECEIVE_INTERRUPT   USART1_RXC_vect
+ 114:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 115:uart.c        ****  #define UART1_TRANSMIT_INTERRUPT  USART1_UDRE_vect
+ 116:uart.c        ****  #define UART0_STATUS   UCSR0A
+ 117:uart.c        ****  #define UART0_CONTROL  UCSR0B
+ 118:uart.c        ****  #define UART0_DATA     UDR0
+ 119:uart.c        ****  #define UART0_UDRIE    UDRIE0
+ 120:uart.c        ****  #define UART1_STATUS   UCSR1A
+ 121:uart.c        ****  #define UART1_CONTROL  UCSR1B
+ 122:uart.c        ****  #define UART1_DATA     UDR1
+ 123:uart.c        ****  #define UART1_UDRIE    UDRIE1
+ 124:uart.c        **** #elif defined(__AVR_ATmega64__) || defined(__AVR_ATmega128__) 
+ 125:uart.c        ****  /* ATmega with two USART */
+ 126:uart.c        ****  #define ATMEGA_USART0
+ 127:uart.c        ****  #define ATMEGA_USART1
+ 128:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 129:uart.c        ****  #define UART1_RECEIVE_INTERRUPT   USART1_RX_vect
+ 130:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 131:uart.c        ****  #define UART1_TRANSMIT_INTERRUPT  USART1_UDRE_vect
+ 132:uart.c        ****  #define UART0_STATUS   UCSR0A
+ 133:uart.c        ****  #define UART0_CONTROL  UCSR0B
+ 134:uart.c        ****  #define UART0_DATA     UDR0
+ 135:uart.c        ****  #define UART0_UDRIE    UDRIE0
+ 136:uart.c        ****  #define UART1_STATUS   UCSR1A
+ 137:uart.c        ****  #define UART1_CONTROL  UCSR1B
+ 138:uart.c        ****  #define UART1_DATA     UDR1
+ 139:uart.c        ****  #define UART1_UDRIE    UDRIE1
+ 140:uart.c        **** #elif defined(__AVR_ATmega161__)
+ 141:uart.c        ****  /* ATmega with UART */
+ 142:uart.c        ****  #error "AVR ATmega161 currently not supported by this libaray !"
+ 143:uart.c        **** #elif defined(__AVR_ATmega169__) 
+ 144:uart.c        ****  /* ATmega with one USART */
+ 145:uart.c        ****  #define ATMEGA_USART
+ 146:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 147:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 148:uart.c        ****  #define UART0_STATUS   UCSRA
+ 149:uart.c        ****  #define UART0_CONTROL  UCSRB
+ 150:uart.c        ****  #define UART0_DATA     UDR
+ 151:uart.c        ****  #define UART0_UDRIE    UDRIE
+ 152:uart.c        **** #elif defined(__AVR_ATmega48__) || defined(__AVR_ATmega88__) || defined(__AVR_ATmega168__) || defin
+ 153:uart.c        ****  || defined(__AVR_ATmega3250__) || defined(__AVR_ATmega3290__) ||defined(__AVR_ATmega6450__) || def
+ 154:uart.c        ****  /* ATmega with one USART */
+ 155:uart.c        ****  #define ATMEGA_USART0
+ 156:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART_RX_vect
+ 157:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART_UDRE_vect
+ 158:uart.c        ****  #define UART0_STATUS   UCSR0A
+ 159:uart.c        ****  #define UART0_CONTROL  UCSR0B
+ 160:uart.c        ****  #define UART0_DATA     UDR0
+ 161:uart.c        ****  #define UART0_UDRIE    UDRIE0
+ 162:uart.c        **** #elif defined(__AVR_ATtiny2313__) 
+ 163:uart.c        ****  #define ATMEGA_USART
+ 164:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART_RX_vect
+ 165:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART_UDRE_vect
+ 166:uart.c        ****  #define UART0_STATUS   UCSRA
+ 167:uart.c        ****  #define UART0_CONTROL  UCSRB
+ 168:uart.c        ****  #define UART0_DATA     UDR
+ 169:uart.c        ****  #define UART0_UDRIE    UDRIE
+ 170:uart.c        **** #elif defined(__AVR_ATmega329__) || \
+ 171:uart.c        ****       defined(__AVR_ATmega649__) || \
+ 172:uart.c        ****       defined(__AVR_ATmega325__) || \
+ 173:uart.c        ****       defined(__AVR_ATmega645__) 
+ 174:uart.c        ****   /* ATmega with one USART */
+ 175:uart.c        ****   #define ATMEGA_USART0
+ 176:uart.c        ****   #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 177:uart.c        ****   #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 178:uart.c        ****   #define UART0_STATUS   UCSR0A
+ 179:uart.c        ****   #define UART0_CONTROL  UCSR0B
+ 180:uart.c        ****   #define UART0_DATA     UDR0
+ 181:uart.c        ****   #define UART0_UDRIE    UDRIE0
+ 182:uart.c        **** #elif defined(__AVR_ATmega2560__) || defined(__AVR_ATmega2561__) || defined(__AVR_ATmega1280__)  ||
+ 183:uart.c        **** /* ATmega with two USART */
+ 184:uart.c        ****   #define ATMEGA_USART0
+ 185:uart.c        ****   #define ATMEGA_USART1
+ 186:uart.c        ****   #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 187:uart.c        ****   #define UART1_RECEIVE_INTERRUPT   USART1_RX_vect
+ 188:uart.c        ****   #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 189:uart.c        ****   #define UART1_TRANSMIT_INTERRUPT  USART1_UDRE_vect
+ 190:uart.c        ****   #define UART0_STATUS   UCSR0A
+ 191:uart.c        ****   #define UART0_CONTROL  UCSR0B
+ 192:uart.c        ****   #define UART0_DATA     UDR0
+ 193:uart.c        ****   #define UART0_UDRIE    UDRIE0
+ 194:uart.c        ****   #define UART1_STATUS   UCSR1A
+ 195:uart.c        ****   #define UART1_CONTROL  UCSR1B
+ 196:uart.c        ****   #define UART1_DATA     UDR1
+ 197:uart.c        ****   #define UART1_UDRIE    UDRIE1  
+ 198:uart.c        **** #elif defined(__AVR_ATmega644__)
+ 199:uart.c        ****  /* ATmega with one USART */
+ 200:uart.c        ****  #define ATMEGA_USART0
+ 201:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 202:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 203:uart.c        ****  #define UART0_STATUS   UCSR0A
+ 204:uart.c        ****  #define UART0_CONTROL  UCSR0B
+ 205:uart.c        ****  #define UART0_DATA     UDR0
+ 206:uart.c        ****  #define UART0_UDRIE    UDRIE0
+ 207:uart.c        **** #elif defined(__AVR_ATmega164P__) || defined(__AVR_ATmega324P__) || defined(__AVR_ATmega644P__)
+ 208:uart.c        ****  /* ATmega with two USART */
+ 209:uart.c        ****  #define ATMEGA_USART0
+ 210:uart.c        ****  #define ATMEGA_USART1
+ 211:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART0_RX_vect
+ 212:uart.c        ****  #define UART1_RECEIVE_INTERRUPT   USART1_RX_vect
+ 213:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART0_UDRE_vect
+ 214:uart.c        ****  #define UART1_TRANSMIT_INTERRUPT  USART1_UDRE_vect
+ 215:uart.c        ****  #define UART0_STATUS   UCSR0A
+ 216:uart.c        ****  #define UART0_CONTROL  UCSR0B
+ 217:uart.c        ****  #define UART0_DATA     UDR0
+ 218:uart.c        ****  #define UART0_UDRIE    UDRIE0
+ 219:uart.c        ****  #define UART1_STATUS   UCSR1A
+ 220:uart.c        ****  #define UART1_CONTROL  UCSR1B
+ 221:uart.c        ****  #define UART1_DATA     UDR1
+ 222:uart.c        ****  #define UART1_UDRIE    UDRIE1
+ 223:uart.c        **** #elif defined(__AVR_AT90USB646__) || defined(__AVR_AT90USB1286__) || defined(__AVR_AT90USB647__) ||
+ 224:uart.c        ****  /* AT90USBxx with one USART */
+ 225:uart.c        ****  #define AT90USB_USART
+ 226:uart.c        ****  #define UART0_RECEIVE_INTERRUPT   USART1_RX_vect
+ 227:uart.c        ****  #define UART0_TRANSMIT_INTERRUPT  USART1_UDRE_vect
+ 228:uart.c        ****  #define UART0_STATUS   UCSR1A
+ 229:uart.c        ****  #define UART0_CONTROL  UCSR1B
+ 230:uart.c        ****  #define UART0_DATA     UDR1
+ 231:uart.c        ****  #define UART0_UDRIE    UDRIE1
+ 232:uart.c        **** #else
+ 233:uart.c        ****  #error "no UART definition for MCU available"
+ 234:uart.c        **** #endif
+ 235:uart.c        **** 
+ 236:uart.c        **** 
+ 237:uart.c        **** /*
+ 238:uart.c        ****  *  module global variables
+ 239:uart.c        ****  */
+ 240:uart.c        **** static volatile unsigned char UART_TxBuf[UART_TX_BUFFER_SIZE];
+ 241:uart.c        **** static volatile unsigned char UART_RxBuf[UART_RX_BUFFER_SIZE];
+ 242:uart.c        **** static volatile unsigned char UART_TxHead;
+ 243:uart.c        **** static volatile unsigned char UART_TxTail;
+ 244:uart.c        **** static volatile unsigned char UART_RxHead;
+ 245:uart.c        **** static volatile unsigned char UART_RxTail;
+ 246:uart.c        **** static volatile unsigned char UART_LastRxError;
+ 247:uart.c        **** 
+ 248:uart.c        **** #if defined( ATMEGA_USART1 )
+ 249:uart.c        **** static volatile unsigned char UART1_TxBuf[UART_TX_BUFFER_SIZE];
+ 250:uart.c        **** static volatile unsigned char UART1_RxBuf[UART_RX_BUFFER_SIZE];
+ 251:uart.c        **** static volatile unsigned char UART1_TxHead;
+ 252:uart.c        **** static volatile unsigned char UART1_TxTail;
+ 253:uart.c        **** static volatile unsigned char UART1_RxHead;
+ 254:uart.c        **** static volatile unsigned char UART1_RxTail;
+ 255:uart.c        **** static volatile unsigned char UART1_LastRxError;
+ 256:uart.c        **** #endif
+ 257:uart.c        **** 
+ 258:uart.c        **** 
+ 259:uart.c        **** 
+ 260:uart.c        **** ISR (UART0_RECEIVE_INTERRUPT)	
+ 261:uart.c        **** /*************************************************************************
+ 262:uart.c        **** Function: UART Receive Complete interrupt
+ 263:uart.c        **** Purpose:  called when the UART has received a character
+ 264:uart.c        **** **************************************************************************/
+ 265:uart.c        **** {
+  15               		.loc 1 265 0
+  16               		.cfi_startproc
+  17 0000 1F92      		push r1
+  18               	.LCFI0:
+  19               		.cfi_def_cfa_offset 3
+  20               		.cfi_offset 1, -2
+  21 0002 0F92      		push r0
+  22               	.LCFI1:
+  23               		.cfi_def_cfa_offset 4
+  24               		.cfi_offset 0, -3
+  25 0004 0FB6      		in r0,__SREG__
+  26 0006 0F92      		push r0
+  27 0008 1124      		clr __zero_reg__
+  28 000a 2F93      		push r18
+  29               	.LCFI2:
+  30               		.cfi_def_cfa_offset 5
+  31               		.cfi_offset 18, -4
+  32 000c 8F93      		push r24
+  33               	.LCFI3:
+  34               		.cfi_def_cfa_offset 6
+  35               		.cfi_offset 24, -5
+  36 000e 9F93      		push r25
+  37               	.LCFI4:
+  38               		.cfi_def_cfa_offset 7
+  39               		.cfi_offset 25, -6
+  40 0010 EF93      		push r30
+  41               	.LCFI5:
+  42               		.cfi_def_cfa_offset 8
+  43               		.cfi_offset 30, -7
+  44 0012 FF93      		push r31
+  45               	.LCFI6:
+  46               		.cfi_def_cfa_offset 9
+  47               		.cfi_offset 31, -8
+  48               	/* prologue: Signal */
+  49               	/* frame size = 0 */
+  50               	/* stack size = 8 */
+  51               	.L__stack_usage = 8
+ 266:uart.c        ****     unsigned char tmphead;
+ 267:uart.c        ****     unsigned char data;
+ 268:uart.c        ****     unsigned char usr;
+ 269:uart.c        ****     unsigned char lastRxError;
+ 270:uart.c        ****  
+ 271:uart.c        ****  
+ 272:uart.c        ****     /* read UART status register and UART data register */ 
+ 273:uart.c        ****     usr  = UART0_STATUS;
+  52               		.loc 1 273 0
+  53 0014 8BB1      		in r24,0xb
+  54               	.LVL0:
+ 274:uart.c        ****     data = UART0_DATA;
+  55               		.loc 1 274 0
+  56 0016 9CB1      		in r25,0xc
+  57               	.LVL1:
+ 275:uart.c        ****     
+ 276:uart.c        ****     /* */
+ 277:uart.c        **** #if defined( AT90_UART )
+ 278:uart.c        ****     lastRxError = (usr & (_BV(FE)|_BV(DOR)) );
+ 279:uart.c        **** #elif defined( ATMEGA_USART )
+ 280:uart.c        ****     lastRxError = (usr & (_BV(FE)|_BV(DOR)) );
+  58               		.loc 1 280 0
+  59 0018 8871      		andi r24,lo8(24)
+  60               	.LVL2:
+ 281:uart.c        **** #elif defined( ATMEGA_USART0 )
+ 282:uart.c        ****     lastRxError = (usr & (_BV(FE0)|_BV(DOR0)) );
+ 283:uart.c        **** #elif defined ( ATMEGA_UART )
+ 284:uart.c        ****     lastRxError = (usr & (_BV(FE)|_BV(DOR)) );
+ 285:uart.c        **** #elif defined( AT90USB_USART )
+ 286:uart.c        ****     lastRxError = (usr & (_BV(FE1)|_BV(DOR1)) );
+ 287:uart.c        **** #endif
+ 288:uart.c        ****         
+ 289:uart.c        ****     /* calculate buffer index */ 
+ 290:uart.c        ****     tmphead = ( UART_RxHead + 1) & UART_RX_BUFFER_MASK;
+  61               		.loc 1 290 0
+  62 001a E091 0000 		lds r30,UART_RxHead
+  63 001e EF5F      		subi r30,lo8(-(1))
+  64 0020 EF71      		andi r30,lo8(31)
+  65               	.LVL3:
+ 291:uart.c        ****     
+ 292:uart.c        ****     if ( tmphead == UART_RxTail ) {
+  66               		.loc 1 292 0
+  67 0022 2091 0000 		lds r18,UART_RxTail
+  68 0026 E217      		cp r30,r18
+  69 0028 01F0      		breq .L3
+ 293:uart.c        ****         /* error: receive buffer overflow */
+ 294:uart.c        ****         lastRxError = UART_BUFFER_OVERFLOW >> 8;
+ 295:uart.c        ****     }else{
+ 296:uart.c        ****         /* store new index */
+ 297:uart.c        ****         UART_RxHead = tmphead;
+  70               		.loc 1 297 0
+  71 002a E093 0000 		sts UART_RxHead,r30
+ 298:uart.c        ****         /* store received data in buffer */
+ 299:uart.c        ****         UART_RxBuf[tmphead] = data;
+  72               		.loc 1 299 0
+  73 002e F0E0      		ldi r31,0
+  74 0030 E050      		subi r30,lo8(-(UART_RxBuf))
+  75 0032 F040      		sbci r31,hi8(-(UART_RxBuf))
+  76               	.LVL4:
+  77 0034 9083      		st Z,r25
+  78               	.LVL5:
+  79 0036 00C0      		rjmp .L2
+  80               	.LVL6:
+  81               	.L3:
+ 294:uart.c        ****         lastRxError = UART_BUFFER_OVERFLOW >> 8;
+  82               		.loc 1 294 0
+  83 0038 82E0      		ldi r24,lo8(2)
+  84               	.LVL7:
+  85               	.L2:
+ 300:uart.c        ****     }
+ 301:uart.c        ****     UART_LastRxError |= lastRxError;   
+  86               		.loc 1 301 0
+  87 003a 9091 0000 		lds r25,UART_LastRxError
+  88               	.LVL8:
+  89 003e 982B      		or r25,r24
+  90 0040 9093 0000 		sts UART_LastRxError,r25
+  91               	/* epilogue start */
+ 302:uart.c        **** }
+  92               		.loc 1 302 0
+  93 0044 FF91      		pop r31
+  94 0046 EF91      		pop r30
+  95 0048 9F91      		pop r25
+  96 004a 8F91      		pop r24
+  97               	.LVL9:
+  98 004c 2F91      		pop r18
+  99 004e 0F90      		pop r0
+ 100 0050 0FBE      		out __SREG__,r0
+ 101 0052 0F90      		pop r0
+ 102 0054 1F90      		pop r1
+ 103 0056 1895      		reti
+ 104               		.cfi_endproc
+ 105               	.LFE1:
+ 107               	.global	__vector_12
+ 109               	__vector_12:
+ 110               	.LFB2:
+ 303:uart.c        **** 
+ 304:uart.c        **** 
+ 305:uart.c        **** ISR (UART0_TRANSMIT_INTERRUPT)
+ 306:uart.c        **** /*************************************************************************
+ 307:uart.c        **** Function: UART Data Register Empty interrupt
+ 308:uart.c        **** Purpose:  called when the UART is ready to transmit the next byte
+ 309:uart.c        **** **************************************************************************/
+ 310:uart.c        **** {
+ 111               		.loc 1 310 0
+ 112               		.cfi_startproc
+ 113 0058 1F92      		push r1
+ 114               	.LCFI7:
+ 115               		.cfi_def_cfa_offset 3
+ 116               		.cfi_offset 1, -2
+ 117 005a 0F92      		push r0
+ 118               	.LCFI8:
+ 119               		.cfi_def_cfa_offset 4
+ 120               		.cfi_offset 0, -3
+ 121 005c 0FB6      		in r0,__SREG__
+ 122 005e 0F92      		push r0
+ 123 0060 1124      		clr __zero_reg__
+ 124 0062 8F93      		push r24
+ 125               	.LCFI9:
+ 126               		.cfi_def_cfa_offset 5
+ 127               		.cfi_offset 24, -4
+ 128 0064 9F93      		push r25
+ 129               	.LCFI10:
+ 130               		.cfi_def_cfa_offset 6
+ 131               		.cfi_offset 25, -5
+ 132 0066 EF93      		push r30
+ 133               	.LCFI11:
+ 134               		.cfi_def_cfa_offset 7
+ 135               		.cfi_offset 30, -6
+ 136 0068 FF93      		push r31
+ 137               	.LCFI12:
+ 138               		.cfi_def_cfa_offset 8
+ 139               		.cfi_offset 31, -7
+ 140               	/* prologue: Signal */
+ 141               	/* frame size = 0 */
+ 142               	/* stack size = 7 */
+ 143               	.L__stack_usage = 7
+ 311:uart.c        ****     unsigned char tmptail;
+ 312:uart.c        **** 
+ 313:uart.c        ****     
+ 314:uart.c        ****     if ( UART_TxHead != UART_TxTail) {
+ 144               		.loc 1 314 0
+ 145 006a 9091 0000 		lds r25,UART_TxHead
+ 146 006e 8091 0000 		lds r24,UART_TxTail
+ 147 0072 9817      		cp r25,r24
+ 148 0074 01F0      		breq .L6
+ 315:uart.c        ****         /* calculate and store new buffer index */
+ 316:uart.c        ****         tmptail = (UART_TxTail + 1) & UART_TX_BUFFER_MASK;
+ 149               		.loc 1 316 0
+ 150 0076 E091 0000 		lds r30,UART_TxTail
+ 151 007a EF5F      		subi r30,lo8(-(1))
+ 152 007c EF71      		andi r30,lo8(31)
+ 153               	.LVL10:
+ 317:uart.c        ****         UART_TxTail = tmptail;
+ 154               		.loc 1 317 0
+ 155 007e E093 0000 		sts UART_TxTail,r30
+ 318:uart.c        ****         /* get one byte from buffer and write it to UART */
+ 319:uart.c        ****         UART0_DATA = UART_TxBuf[tmptail];  /* start transmission */
+ 156               		.loc 1 319 0
+ 157 0082 F0E0      		ldi r31,0
+ 158 0084 E050      		subi r30,lo8(-(UART_TxBuf))
+ 159 0086 F040      		sbci r31,hi8(-(UART_TxBuf))
+ 160               	.LVL11:
+ 161 0088 8081      		ld r24,Z
+ 162 008a 8CB9      		out 0xc,r24
+ 163               	.LVL12:
+ 164 008c 00C0      		rjmp .L5
+ 165               	.L6:
+ 320:uart.c        ****     }else{
+ 321:uart.c        ****         /* tx buffer empty, disable UDRE interrupt */
+ 322:uart.c        ****         UART0_CONTROL &= ~_BV(UART0_UDRIE);
+ 166               		.loc 1 322 0
+ 167 008e 5598      		cbi 0xa,5
+ 168               	.L5:
+ 169               	/* epilogue start */
+ 323:uart.c        ****     }
+ 324:uart.c        **** }
+ 170               		.loc 1 324 0
+ 171 0090 FF91      		pop r31
+ 172 0092 EF91      		pop r30
+ 173 0094 9F91      		pop r25
+ 174 0096 8F91      		pop r24
+ 175 0098 0F90      		pop r0
+ 176 009a 0FBE      		out __SREG__,r0
+ 177 009c 0F90      		pop r0
+ 178 009e 1F90      		pop r1
+ 179 00a0 1895      		reti
+ 180               		.cfi_endproc
+ 181               	.LFE2:
+ 183               	.global	uart_getc
+ 185               	uart_getc:
+ 186               	.LFB4:
+ 325:uart.c        **** 
+ 326:uart.c        **** 
+ 327:uart.c        **** /*************************************************************************
+ 328:uart.c        **** Function: uart_init()
+ 329:uart.c        **** Purpose:  initialize UART and set baudrate
+ 330:uart.c        **** Input:    baudrate using macro UART_BAUD_SELECT()
+ 331:uart.c        **** Returns:  none
+ 332:uart.c        **** **************************************************************************/
+ 333:uart.c        **** void uart_init(unsigned int baudrate)
+ 334:uart.c        **** {
+ 335:uart.c        ****     UART_TxHead = 0;
+ 336:uart.c        ****     UART_TxTail = 0;
+ 337:uart.c        ****     UART_RxHead = 0;
+ 338:uart.c        ****     UART_RxTail = 0;
+ 339:uart.c        ****     
+ 340:uart.c        **** #if defined( AT90_UART )
+ 341:uart.c        ****     /* set baud rate */
+ 342:uart.c        ****     UBRR = (unsigned char)baudrate; 
+ 343:uart.c        **** 
+ 344:uart.c        ****     /* enable UART receiver and transmmitter and receive complete interrupt */
+ 345:uart.c        ****     UART0_CONTROL = _BV(RXCIE)|_BV(RXEN)|_BV(TXEN);
+ 346:uart.c        **** 
+ 347:uart.c        **** #elif defined (ATMEGA_USART)
+ 348:uart.c        ****     /* Set baud rate */
+ 349:uart.c        ****     if ( baudrate & 0x8000 )
+ 350:uart.c        ****     {
+ 351:uart.c        ****     	 UART0_STATUS = (1<<U2X);  //Enable 2x speed 
+ 352:uart.c        ****     	 baudrate &= ~0x8000;
+ 353:uart.c        ****     }
+ 354:uart.c        ****     UBRRH = (unsigned char)(baudrate>>8);
+ 355:uart.c        ****     UBRRL = (unsigned char) baudrate;
+ 356:uart.c        ****    
+ 357:uart.c        ****     /* Enable USART receiver and transmitter and receive complete interrupt */
+ 358:uart.c        ****     UART0_CONTROL = _BV(RXCIE)|(1<<RXEN)|(1<<TXEN);
+ 359:uart.c        ****     
+ 360:uart.c        ****     /* Set frame format: asynchronous, 8data, no parity, 1stop bit */
+ 361:uart.c        ****     #ifdef URSEL
+ 362:uart.c        ****     UCSRC = (1<<URSEL)|(3<<UCSZ0);
+ 363:uart.c        ****     #else
+ 364:uart.c        ****     UCSRC = (3<<UCSZ0);
+ 365:uart.c        ****     #endif 
+ 366:uart.c        ****     
+ 367:uart.c        **** #elif defined (ATMEGA_USART0 )
+ 368:uart.c        ****     /* Set baud rate */
+ 369:uart.c        ****     if ( baudrate & 0x8000 ) 
+ 370:uart.c        ****     {
+ 371:uart.c        ****    		UART0_STATUS = (1<<U2X0);  //Enable 2x speed 
+ 372:uart.c        ****    		baudrate &= ~0x8000;
+ 373:uart.c        ****    	}
+ 374:uart.c        ****     UBRR0H = (unsigned char)(baudrate>>8);
+ 375:uart.c        ****     UBRR0L = (unsigned char) baudrate;
+ 376:uart.c        **** 
+ 377:uart.c        ****     /* Enable USART receiver and transmitter and receive complete interrupt */
+ 378:uart.c        ****     UART0_CONTROL = _BV(RXCIE0)|(1<<RXEN0)|(1<<TXEN0);
+ 379:uart.c        ****     
+ 380:uart.c        ****     /* Set frame format: asynchronous, 8data, no parity, 1stop bit */
+ 381:uart.c        ****     #ifdef URSEL0
+ 382:uart.c        ****     UCSR0C = (1<<URSEL0)|(3<<UCSZ00);
+ 383:uart.c        ****     #else
+ 384:uart.c        ****     UCSR0C = (3<<UCSZ00);
+ 385:uart.c        ****     #endif 
+ 386:uart.c        **** 
+ 387:uart.c        **** #elif defined ( ATMEGA_UART )
+ 388:uart.c        ****     /* set baud rate */
+ 389:uart.c        ****     if ( baudrate & 0x8000 ) 
+ 390:uart.c        ****     {
+ 391:uart.c        ****     	UART0_STATUS = (1<<U2X);  //Enable 2x speed 
+ 392:uart.c        ****     	baudrate &= ~0x8000;
+ 393:uart.c        ****     }
+ 394:uart.c        ****     UBRRHI = (unsigned char)(baudrate>>8);
+ 395:uart.c        ****     UBRR   = (unsigned char) baudrate;
+ 396:uart.c        **** 
+ 397:uart.c        ****     /* Enable UART receiver and transmitter and receive complete interrupt */
+ 398:uart.c        ****     UART0_CONTROL = _BV(RXCIE)|(1<<RXEN)|(1<<TXEN);
+ 399:uart.c        **** 
+ 400:uart.c        **** #elif defined ( AT90USB_USART )
+ 401:uart.c        ****    /* set baud rate */
+ 402:uart.c        ****     if ( baudrate & 0x8000 ) 
+ 403:uart.c        ****     {
+ 404:uart.c        ****     	UART0_STATUS = (1<<U2X1 );  //Enable 2x speed 
+ 405:uart.c        ****     	baudrate &= ~0x8000;
+ 406:uart.c        ****     }
+ 407:uart.c        ****     UBRR1H = (unsigned char)(baudrate>>8);
+ 408:uart.c        ****     UBRR1L = (unsigned char) baudrate;
+ 409:uart.c        **** 
+ 410:uart.c        ****     /* Enable UART receiver and transmitter and receive complete interrupt */
+ 411:uart.c        ****     UART0_CONTROL = _BV(RXCIE1)|(1<<RXEN1)|(1<<TXEN1);
+ 412:uart.c        ****     
+ 413:uart.c        ****     /* Set frame format: asynchronous, 8data, no parity, 1stop bit */
+ 414:uart.c        ****     UCSR1C = (1<<UCSZ11)|(1<<UCSZ10);
+ 415:uart.c        **** #endif
+ 416:uart.c        **** 	uart_puts("UART INIT");
+ 417:uart.c        **** 
+ 418:uart.c        **** }/* uart_init */
+ 419:uart.c        **** 
+ 420:uart.c        **** 
+ 421:uart.c        **** /*************************************************************************
+ 422:uart.c        **** Function: uart_getc()
+ 423:uart.c        **** Purpose:  return byte from ringbuffer  
+ 424:uart.c        **** Returns:  lower byte:  received byte from ringbuffer
+ 425:uart.c        ****           higher byte: last receive error
+ 426:uart.c        **** **************************************************************************/
+ 427:uart.c        **** unsigned int uart_getc(void)
+ 428:uart.c        **** {    
+ 187               		.loc 1 428 0
+ 188               		.cfi_startproc
+ 189               	/* prologue: function */
+ 190               	/* frame size = 0 */
+ 191               	/* stack size = 0 */
+ 192               	.L__stack_usage = 0
+ 429:uart.c        ****     unsigned char tmptail;
+ 430:uart.c        ****     unsigned char data;
+ 431:uart.c        **** 
+ 432:uart.c        **** 
+ 433:uart.c        ****     if ( UART_RxHead == UART_RxTail ) {
+ 193               		.loc 1 433 0
+ 194 00a2 9091 0000 		lds r25,UART_RxHead
+ 195 00a6 8091 0000 		lds r24,UART_RxTail
+ 196 00aa 9817      		cp r25,r24
+ 197 00ac 01F0      		breq .L10
+ 198               	.LBB8:
+ 199               	.LBB9:
+ 434:uart.c        ****         return UART_NO_DATA;   /* no data available */
+ 435:uart.c        ****     }
+ 436:uart.c        ****     
+ 437:uart.c        ****     /* calculate /store buffer index */
+ 438:uart.c        ****     tmptail = (UART_RxTail + 1) & UART_RX_BUFFER_MASK;
+ 200               		.loc 1 438 0
+ 201 00ae E091 0000 		lds r30,UART_RxTail
+ 202 00b2 EF5F      		subi r30,lo8(-(1))
+ 203 00b4 EF71      		andi r30,lo8(31)
+ 204               	.LVL13:
+ 439:uart.c        ****     UART_RxTail = tmptail; 
+ 205               		.loc 1 439 0
+ 206 00b6 E093 0000 		sts UART_RxTail,r30
+ 440:uart.c        ****     
+ 441:uart.c        ****     /* get data from receive buffer */
+ 442:uart.c        ****     data = UART_RxBuf[tmptail];
+ 207               		.loc 1 442 0
+ 208 00ba F0E0      		ldi r31,0
+ 209 00bc E050      		subi r30,lo8(-(UART_RxBuf))
+ 210 00be F040      		sbci r31,hi8(-(UART_RxBuf))
+ 211               	.LVL14:
+ 212 00c0 8081      		ld r24,Z
+ 213               	.LVL15:
+ 443:uart.c        ****     
+ 444:uart.c        ****     data = (UART_LastRxError << 8) + data;
+ 214               		.loc 1 444 0
+ 215 00c2 9091 0000 		lds r25,UART_LastRxError
+ 445:uart.c        ****     UART_LastRxError = 0;
+ 216               		.loc 1 445 0
+ 217 00c6 1092 0000 		sts UART_LastRxError,__zero_reg__
+ 218               	.LVL16:
+ 446:uart.c        ****     return data;
+ 219               		.loc 1 446 0
+ 220 00ca 90E0      		ldi r25,0
+ 221 00cc 0895      		ret
+ 222               	.LVL17:
+ 223               	.L10:
+ 224               	.LBE9:
+ 225               	.LBE8:
+ 434:uart.c        ****         return UART_NO_DATA;   /* no data available */
+ 226               		.loc 1 434 0
+ 227 00ce 80E0      		ldi r24,0
+ 228 00d0 91E0      		ldi r25,lo8(1)
+ 447:uart.c        **** 
+ 448:uart.c        **** }/* uart_getc */
+ 229               		.loc 1 448 0
+ 230 00d2 0895      		ret
+ 231               		.cfi_endproc
+ 232               	.LFE4:
+ 234               	.global	uart_putc
+ 236               	uart_putc:
+ 237               	.LFB5:
+ 449:uart.c        **** 
+ 450:uart.c        **** 
+ 451:uart.c        **** /*************************************************************************
+ 452:uart.c        **** Function: uart_putc()
+ 453:uart.c        **** Purpose:  write byte to ringbuffer for transmitting via UART
+ 454:uart.c        **** Input:    byte to be transmitted
+ 455:uart.c        **** Returns:  none          
+ 456:uart.c        **** **************************************************************************/
+ 457:uart.c        **** void uart_putc(unsigned char data)
+ 458:uart.c        **** {
+ 238               		.loc 1 458 0
+ 239               		.cfi_startproc
+ 240               	.LVL18:
+ 241               	/* prologue: function */
+ 242               	/* frame size = 0 */
+ 243               	/* stack size = 0 */
+ 244               	.L__stack_usage = 0
+ 459:uart.c        ****     unsigned char tmphead;
+ 460:uart.c        **** 
+ 461:uart.c        ****     
+ 462:uart.c        ****     tmphead  = (UART_TxHead + 1) & UART_TX_BUFFER_MASK;
+ 245               		.loc 1 462 0
+ 246 00d4 9091 0000 		lds r25,UART_TxHead
+ 247 00d8 9F5F      		subi r25,lo8(-(1))
+ 248 00da 9F71      		andi r25,lo8(31)
+ 249               	.LVL19:
+ 250               	.L13:
+ 463:uart.c        ****     
+ 464:uart.c        ****     while ( tmphead == UART_TxTail ){
+ 251               		.loc 1 464 0 discriminator 1
+ 252 00dc 2091 0000 		lds r18,UART_TxTail
+ 253 00e0 9217      		cp r25,r18
+ 254 00e2 01F0      		breq .L13
+ 465:uart.c        ****         ;/* wait for free space in buffer */
+ 466:uart.c        ****     }
+ 467:uart.c        ****     
+ 468:uart.c        ****     UART_TxBuf[tmphead] = data;
+ 255               		.loc 1 468 0
+ 256 00e4 E92F      		mov r30,r25
+ 257 00e6 F0E0      		ldi r31,0
+ 258 00e8 E050      		subi r30,lo8(-(UART_TxBuf))
+ 259 00ea F040      		sbci r31,hi8(-(UART_TxBuf))
+ 260 00ec 8083      		st Z,r24
+ 469:uart.c        ****     UART_TxHead = tmphead;
+ 261               		.loc 1 469 0
+ 262 00ee 9093 0000 		sts UART_TxHead,r25
+ 470:uart.c        **** 
+ 471:uart.c        ****     /* enable UDRE interrupt */
+ 472:uart.c        ****     UART0_CONTROL    |= _BV(UART0_UDRIE);
+ 263               		.loc 1 472 0
+ 264 00f2 559A      		sbi 0xa,5
+ 265 00f4 0895      		ret
+ 266               		.cfi_endproc
+ 267               	.LFE5:
+ 269               	.global	uart_puts
+ 271               	uart_puts:
+ 272               	.LFB6:
+ 473:uart.c        **** 
+ 474:uart.c        **** }/* uart_putc */
+ 475:uart.c        **** 
+ 476:uart.c        **** 
+ 477:uart.c        **** /*************************************************************************
+ 478:uart.c        **** Function: uart_puts()
+ 479:uart.c        **** Purpose:  transmit string to UART
+ 480:uart.c        **** Input:    string to be transmitted
+ 481:uart.c        **** Returns:  none          
+ 482:uart.c        **** **************************************************************************/
+ 483:uart.c        **** void uart_puts(const char *s )
+ 484:uart.c        **** {
+ 273               		.loc 1 484 0
+ 274               		.cfi_startproc
+ 275               	.LVL20:
+ 276 00f6 CF93      		push r28
+ 277               	.LCFI13:
+ 278               		.cfi_def_cfa_offset 3
+ 279               		.cfi_offset 28, -2
+ 280 00f8 DF93      		push r29
+ 281               	.LCFI14:
+ 282               		.cfi_def_cfa_offset 4
+ 283               		.cfi_offset 29, -3
+ 284               	/* prologue: function */
+ 285               	/* frame size = 0 */
+ 286               	/* stack size = 2 */
+ 287               	.L__stack_usage = 2
+ 288 00fa EC01      		movw r28,r24
+ 289               	.LVL21:
+ 290               	.L15:
+ 485:uart.c        ****     while (*s) 
+ 291               		.loc 1 485 0 discriminator 1
+ 292 00fc 8991      		ld r24,Y+
+ 293               	.LVL22:
+ 294 00fe 8823      		tst r24
+ 295 0100 01F0      		breq .L17
+ 296               	.LVL23:
+ 486:uart.c        ****       uart_putc(*s++);
+ 297               		.loc 1 486 0
+ 298 0102 00D0      		rcall uart_putc
+ 299               	.LVL24:
+ 300 0104 00C0      		rjmp .L15
+ 301               	.LVL25:
+ 302               	.L17:
+ 303               	/* epilogue start */
+ 487:uart.c        **** 
+ 488:uart.c        **** }/* uart_puts */
+ 304               		.loc 1 488 0
+ 305 0106 DF91      		pop r29
+ 306 0108 CF91      		pop r28
+ 307               	.LVL26:
+ 308 010a 0895      		ret
+ 309               		.cfi_endproc
+ 310               	.LFE6:
+ 312               		.section	.rodata.str1.1,"aMS",@progbits,1
+ 313               	.LC0:
+ 314 0000 5541 5254 		.string	"UART INIT"
+ 314      2049 4E49 
+ 314      5400 
+ 315               		.text
+ 316               	.global	uart_init
+ 318               	uart_init:
+ 319               	.LFB3:
+ 334:uart.c        **** {
+ 320               		.loc 1 334 0
+ 321               		.cfi_startproc
+ 322               	.LVL27:
+ 323               	/* prologue: function */
+ 324               	/* frame size = 0 */
+ 325               	/* stack size = 0 */
+ 326               	.L__stack_usage = 0
+ 335:uart.c        ****     UART_TxHead = 0;
+ 327               		.loc 1 335 0
+ 328 010c 1092 0000 		sts UART_TxHead,__zero_reg__
+ 336:uart.c        ****     UART_TxTail = 0;
+ 329               		.loc 1 336 0
+ 330 0110 1092 0000 		sts UART_TxTail,__zero_reg__
+ 337:uart.c        ****     UART_RxHead = 0;
+ 331               		.loc 1 337 0
+ 332 0114 1092 0000 		sts UART_RxHead,__zero_reg__
+ 338:uart.c        ****     UART_RxTail = 0;
+ 333               		.loc 1 338 0
+ 334 0118 1092 0000 		sts UART_RxTail,__zero_reg__
+ 349:uart.c        ****     if ( baudrate & 0x8000 )
+ 335               		.loc 1 349 0
+ 336 011c 97FF      		sbrs r25,7
+ 337 011e 00C0      		rjmp .L19
+ 351:uart.c        ****     	 UART0_STATUS = (1<<U2X);  //Enable 2x speed 
+ 338               		.loc 1 351 0
+ 339 0120 22E0      		ldi r18,lo8(2)
+ 340 0122 2BB9      		out 0xb,r18
+ 352:uart.c        ****     	 baudrate &= ~0x8000;
+ 341               		.loc 1 352 0
+ 342 0124 9F77      		andi r25,127
+ 343               	.LVL28:
+ 344               	.L19:
+ 354:uart.c        ****     UBRRH = (unsigned char)(baudrate>>8);
+ 345               		.loc 1 354 0
+ 346 0126 90BD      		out 0x20,r25
+ 355:uart.c        ****     UBRRL = (unsigned char) baudrate;
+ 347               		.loc 1 355 0
+ 348 0128 89B9      		out 0x9,r24
+ 358:uart.c        ****     UART0_CONTROL = _BV(RXCIE)|(1<<RXEN)|(1<<TXEN);
+ 349               		.loc 1 358 0
+ 350 012a 88E9      		ldi r24,lo8(-104)
+ 351               	.LVL29:
+ 352 012c 8AB9      		out 0xa,r24
+ 362:uart.c        ****     UCSRC = (1<<URSEL)|(3<<UCSZ0);
+ 353               		.loc 1 362 0
+ 354 012e 86E8      		ldi r24,lo8(-122)
+ 355 0130 80BD      		out 0x20,r24
+ 416:uart.c        **** 	uart_puts("UART INIT");
+ 356               		.loc 1 416 0
+ 357 0132 80E0      		ldi r24,lo8(.LC0)
+ 358 0134 90E0      		ldi r25,hi8(.LC0)
+ 359 0136 00C0      		rjmp uart_puts
+ 360               	.LVL30:
+ 361               		.cfi_endproc
+ 362               	.LFE3:
+ 364               	.global	uart_puts_p
+ 366               	uart_puts_p:
+ 367               	.LFB7:
+ 489:uart.c        **** 
+ 490:uart.c        **** 
+ 491:uart.c        **** /*************************************************************************
+ 492:uart.c        **** Function: uart_puts_p()
+ 493:uart.c        **** Purpose:  transmit string from program memory to UART
+ 494:uart.c        **** Input:    program memory string to be transmitted
+ 495:uart.c        **** Returns:  none
+ 496:uart.c        **** **************************************************************************/
+ 497:uart.c        **** void uart_puts_p(const char *progmem_s )
+ 498:uart.c        **** {
+ 368               		.loc 1 498 0
+ 369               		.cfi_startproc
+ 370               	.LVL31:
+ 371 0138 CF93      		push r28
+ 372               	.LCFI15:
+ 373               		.cfi_def_cfa_offset 3
+ 374               		.cfi_offset 28, -2
+ 375 013a DF93      		push r29
+ 376               	.LCFI16:
+ 377               		.cfi_def_cfa_offset 4
+ 378               		.cfi_offset 29, -3
+ 379               	/* prologue: function */
+ 380               	/* frame size = 0 */
+ 381               	/* stack size = 2 */
+ 382               	.L__stack_usage = 2
+ 383 013c FC01      		movw r30,r24
+ 384               	.LVL32:
+ 385               	.L21:
+ 386               	.LBB10:
+ 499:uart.c        ****     register char c;
+ 500:uart.c        ****     
+ 501:uart.c        ****     while ( (c = pgm_read_byte(progmem_s++)) ) 
+ 387               		.loc 1 501 0 discriminator 1
+ 388               	/* #APP */
+ 389               	 ;  501 "uart.c" 1
+ 390 013e 8491      		lpm r24, Z
+ 391               		
+ 392               	 ;  0 "" 2
+ 393               	.LVL33:
+ 394               	/* #NOAPP */
+ 395 0140 EF01      		movw r28,r30
+ 396 0142 2196      		adiw r28,1
+ 397               	.LVL34:
+ 398               	.LBE10:
+ 399 0144 8823      		tst r24
+ 400 0146 01F0      		breq .L23
+ 502:uart.c        ****       uart_putc(c);
+ 401               		.loc 1 502 0
+ 402 0148 00D0      		rcall uart_putc
+ 403               	.LVL35:
+ 404 014a FE01      		movw r30,r28
+ 405 014c 00C0      		rjmp .L21
+ 406               	.LVL36:
+ 407               	.L23:
+ 408               	/* epilogue start */
+ 503:uart.c        **** 
+ 504:uart.c        **** }/* uart_puts_p */
+ 409               		.loc 1 504 0
+ 410 014e DF91      		pop r29
+ 411 0150 CF91      		pop r28
+ 412               	.LVL37:
+ 413 0152 0895      		ret
+ 414               		.cfi_endproc
+ 415               	.LFE7:
+ 417               	.global	rotate
+ 419               	rotate:
+ 420               	.LFB14:
+ 421               		.file 2 "main.c"
+   1:main.c        **** #include <stdlib.h>
+   2:main.c        **** #include <avr/io.h>
+   3:main.c        **** #include <avr/interrupt.h>
+   4:main.c        **** #include <avr/pgmspace.h>
+   5:main.c        **** #include <avr/eeprom.h>
+   6:main.c        **** #include "uart.c"
+   7:main.c        **** #include <ctype.h>
+   8:main.c        **** #include <string.h>
+   9:main.c        **** 
+  10:main.c        **** /* define CPU frequency in Mhz here if not defined in Makefile */
+  11:main.c        **** #ifndef F_CPU
+  12:main.c        **** #define F_CPU 1000000UL
+  13:main.c        **** #endif
+  14:main.c        **** 
+  15:main.c        **** #include <util/delay.h>
+  16:main.c        **** 
+  17:main.c        **** #define BLUE     _BV(PC5)
+  18:main.c        **** #define BLACK    _BV(PC4)
+  19:main.c        **** #define RED      _BV(PC3)
+  20:main.c        **** #define YELLOW   _BV(PC2)
+  21:main.c        **** /* 9600 baud */
+  22:main.c        **** #define UART_BAUD_RATE      1200  
+  23:main.c        ****     
+  24:main.c        **** uint8_t one;
+  25:main.c        **** uint8_t two;
+  26:main.c        **** uint8_t three;
+  27:main.c        **** 
+  28:main.c        **** long vol = 0;
+  29:main.c        **** char vol_str[50];
+  30:main.c        **** long target = 0;
+  31:main.c        **** char target_str[50];
+  32:main.c        **** long tempvol;
+  33:main.c        **** long temptarget;
+  34:main.c        **** 
+  35:main.c        **** const uint8_t delay = 2;
+  36:main.c        **** uint8_t step = 0;
+  37:main.c        **** const unsigned long tsteps = 500;
+  38:main.c        **** const unsigned long maxsteps = 2000;
+  39:main.c        **** const unsigned int FACTOR = 1500 / 256;
+  40:main.c        **** char last_direction='r';
+  41:main.c        **** char mode = 's'; // run/stop
+  42:main.c        **** uint8_t i = 0;
+  43:main.c        **** 
+  44:main.c        **** const uint8_t clockwise[] = {BLUE, BLACK, RED, YELLOW};
+  45:main.c        **** 
+  46:main.c        **** void rotate (unsigned char direction)
+  47:main.c        **** {    
+ 422               		.loc 2 47 0
+ 423               		.cfi_startproc
+ 424               	.LVL38:
+ 425               	/* prologue: function */
+ 426               	/* frame size = 0 */
+ 427               	/* stack size = 0 */
+ 428               	.L__stack_usage = 0
+  48:main.c        **** 		PORTC = clockwise[step];      
+ 429               		.loc 2 48 0
+ 430 0154 E091 0000 		lds r30,step
+ 431 0158 F0E0      		ldi r31,0
+ 432 015a E050      		subi r30,lo8(-(clockwise))
+ 433 015c F040      		sbci r31,hi8(-(clockwise))
+ 434 015e 9081      		ld r25,Z
+ 435 0160 95BB      		out 0x15,r25
+ 436               	.LVL39:
+ 437               	.LBB17:
+ 438               	.LBB18:
+ 439               		.file 3 "/usr/lib/avr/include/util/delay.h"
+   1:/usr/lib/avr/include/util/delay.h **** /* Copyright (c) 2002, Marek Michalkiewicz
+   2:/usr/lib/avr/include/util/delay.h ****    Copyright (c) 2004,2005,2007 Joerg Wunsch
+   3:/usr/lib/avr/include/util/delay.h ****    Copyright (c) 2007  Florin-Viorel Petrov
+   4:/usr/lib/avr/include/util/delay.h ****    All rights reserved.
+   5:/usr/lib/avr/include/util/delay.h **** 
+   6:/usr/lib/avr/include/util/delay.h ****    Redistribution and use in source and binary forms, with or without
+   7:/usr/lib/avr/include/util/delay.h ****    modification, are permitted provided that the following conditions are met:
+   8:/usr/lib/avr/include/util/delay.h **** 
+   9:/usr/lib/avr/include/util/delay.h ****    * Redistributions of source code must retain the above copyright
+  10:/usr/lib/avr/include/util/delay.h ****      notice, this list of conditions and the following disclaimer.
+  11:/usr/lib/avr/include/util/delay.h **** 
+  12:/usr/lib/avr/include/util/delay.h ****    * Redistributions in binary form must reproduce the above copyright
+  13:/usr/lib/avr/include/util/delay.h ****      notice, this list of conditions and the following disclaimer in
+  14:/usr/lib/avr/include/util/delay.h ****      the documentation and/or other materials provided with the
+  15:/usr/lib/avr/include/util/delay.h ****      distribution.
+  16:/usr/lib/avr/include/util/delay.h **** 
+  17:/usr/lib/avr/include/util/delay.h ****    * Neither the name of the copyright holders nor the names of
+  18:/usr/lib/avr/include/util/delay.h ****      contributors may be used to endorse or promote products derived
+  19:/usr/lib/avr/include/util/delay.h ****      from this software without specific prior written permission.
+  20:/usr/lib/avr/include/util/delay.h **** 
+  21:/usr/lib/avr/include/util/delay.h ****   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  22:/usr/lib/avr/include/util/delay.h ****   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  23:/usr/lib/avr/include/util/delay.h ****   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  24:/usr/lib/avr/include/util/delay.h ****   ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+  25:/usr/lib/avr/include/util/delay.h ****   LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  26:/usr/lib/avr/include/util/delay.h ****   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  27:/usr/lib/avr/include/util/delay.h ****   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  28:/usr/lib/avr/include/util/delay.h ****   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  29:/usr/lib/avr/include/util/delay.h ****   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  30:/usr/lib/avr/include/util/delay.h ****   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  31:/usr/lib/avr/include/util/delay.h ****   POSSIBILITY OF SUCH DAMAGE. */
+  32:/usr/lib/avr/include/util/delay.h **** 
+  33:/usr/lib/avr/include/util/delay.h **** /* $Id: delay.h.in 2251 2011-09-14 08:20:33Z joerg_wunsch $ */
+  34:/usr/lib/avr/include/util/delay.h **** 
+  35:/usr/lib/avr/include/util/delay.h **** #ifndef _UTIL_DELAY_H_
+  36:/usr/lib/avr/include/util/delay.h **** #define _UTIL_DELAY_H_ 1
+  37:/usr/lib/avr/include/util/delay.h **** 
+  38:/usr/lib/avr/include/util/delay.h **** #ifndef __HAS_DELAY_CYCLES
+  39:/usr/lib/avr/include/util/delay.h **** #define __HAS_DELAY_CYCLES 1
+  40:/usr/lib/avr/include/util/delay.h **** #endif
+  41:/usr/lib/avr/include/util/delay.h **** 
+  42:/usr/lib/avr/include/util/delay.h **** #include <inttypes.h>
+  43:/usr/lib/avr/include/util/delay.h **** #include <util/delay_basic.h>
+  44:/usr/lib/avr/include/util/delay.h **** #include <math.h>
+  45:/usr/lib/avr/include/util/delay.h **** 
+  46:/usr/lib/avr/include/util/delay.h **** /** \file */
+  47:/usr/lib/avr/include/util/delay.h **** /** \defgroup util_delay <util/delay.h>: Convenience functions for busy-wait delay loops
+  48:/usr/lib/avr/include/util/delay.h ****     \code
+  49:/usr/lib/avr/include/util/delay.h ****     #define F_CPU 1000000UL  // 1 MHz
+  50:/usr/lib/avr/include/util/delay.h ****     //#define F_CPU 14.7456E6
+  51:/usr/lib/avr/include/util/delay.h ****     #include <util/delay.h>
+  52:/usr/lib/avr/include/util/delay.h ****     \endcode
+  53:/usr/lib/avr/include/util/delay.h **** 
+  54:/usr/lib/avr/include/util/delay.h ****     \note As an alternative method, it is possible to pass the
+  55:/usr/lib/avr/include/util/delay.h ****     F_CPU macro down to the compiler from the Makefile.
+  56:/usr/lib/avr/include/util/delay.h ****     Obviously, in that case, no \c \#define statement should be
+  57:/usr/lib/avr/include/util/delay.h ****     used.
+  58:/usr/lib/avr/include/util/delay.h **** 
+  59:/usr/lib/avr/include/util/delay.h ****     The functions in this header file are wrappers around the basic
+  60:/usr/lib/avr/include/util/delay.h ****     busy-wait functions from <util/delay_basic.h>.  They are meant as
+  61:/usr/lib/avr/include/util/delay.h ****     convenience functions where actual time values can be specified
+  62:/usr/lib/avr/include/util/delay.h ****     rather than a number of cycles to wait for.  The idea behind is
+  63:/usr/lib/avr/include/util/delay.h ****     that compile-time constant expressions will be eliminated by
+  64:/usr/lib/avr/include/util/delay.h ****     compiler optimization so floating-point expressions can be used
+  65:/usr/lib/avr/include/util/delay.h ****     to calculate the number of delay cycles needed based on the CPU
+  66:/usr/lib/avr/include/util/delay.h ****     frequency passed by the macro F_CPU.
+  67:/usr/lib/avr/include/util/delay.h **** 
+  68:/usr/lib/avr/include/util/delay.h ****     \note In order for these functions to work as intended, compiler
+  69:/usr/lib/avr/include/util/delay.h ****     optimizations <em>must</em> be enabled, and the delay time
+  70:/usr/lib/avr/include/util/delay.h ****     <em>must</em> be an expression that is a known constant at
+  71:/usr/lib/avr/include/util/delay.h ****     compile-time.  If these requirements are not met, the resulting
+  72:/usr/lib/avr/include/util/delay.h ****     delay will be much longer (and basically unpredictable), and
+  73:/usr/lib/avr/include/util/delay.h ****     applications that otherwise do not use floating-point calculations
+  74:/usr/lib/avr/include/util/delay.h ****     will experience severe code bloat by the floating-point library
+  75:/usr/lib/avr/include/util/delay.h ****     routines linked into the application.
+  76:/usr/lib/avr/include/util/delay.h **** 
+  77:/usr/lib/avr/include/util/delay.h ****     The functions available allow the specification of microsecond, and
+  78:/usr/lib/avr/include/util/delay.h ****     millisecond delays directly, using the application-supplied macro
+  79:/usr/lib/avr/include/util/delay.h ****     F_CPU as the CPU clock frequency (in Hertz).
+  80:/usr/lib/avr/include/util/delay.h **** 
+  81:/usr/lib/avr/include/util/delay.h **** */
+  82:/usr/lib/avr/include/util/delay.h **** 
+  83:/usr/lib/avr/include/util/delay.h **** #if !defined(__DOXYGEN__)
+  84:/usr/lib/avr/include/util/delay.h **** static inline void _delay_us(double __us) __attribute__((always_inline));
+  85:/usr/lib/avr/include/util/delay.h **** static inline void _delay_ms(double __ms) __attribute__((always_inline));
+  86:/usr/lib/avr/include/util/delay.h **** #endif
+  87:/usr/lib/avr/include/util/delay.h **** 
+  88:/usr/lib/avr/include/util/delay.h **** #ifndef F_CPU
+  89:/usr/lib/avr/include/util/delay.h **** /* prevent compiler error by supplying a default */
+  90:/usr/lib/avr/include/util/delay.h **** # warning "F_CPU not defined for <util/delay.h>"
+  91:/usr/lib/avr/include/util/delay.h **** # define F_CPU 1000000UL
+  92:/usr/lib/avr/include/util/delay.h **** #endif
+  93:/usr/lib/avr/include/util/delay.h **** 
+  94:/usr/lib/avr/include/util/delay.h **** #ifndef __OPTIMIZE__
+  95:/usr/lib/avr/include/util/delay.h **** # warning "Compiler optimizations disabled; functions from <util/delay.h> won't work as designed"
+  96:/usr/lib/avr/include/util/delay.h **** #endif
+  97:/usr/lib/avr/include/util/delay.h **** 
+  98:/usr/lib/avr/include/util/delay.h **** #if __HAS_DELAY_CYCLES && defined(__OPTIMIZE__) && \
+  99:/usr/lib/avr/include/util/delay.h ****   !defined(__DELAY_BACKWARD_COMPATIBLE__) &&	   \
+ 100:/usr/lib/avr/include/util/delay.h ****   __STDC_HOSTED__
+ 101:/usr/lib/avr/include/util/delay.h **** #  include <math.h>
+ 102:/usr/lib/avr/include/util/delay.h **** #endif
+ 103:/usr/lib/avr/include/util/delay.h **** 
+ 104:/usr/lib/avr/include/util/delay.h **** /**
+ 105:/usr/lib/avr/include/util/delay.h ****    \ingroup util_delay
+ 106:/usr/lib/avr/include/util/delay.h **** 
+ 107:/usr/lib/avr/include/util/delay.h ****    Perform a delay of \c __ms milliseconds, using _delay_loop_2().
+ 108:/usr/lib/avr/include/util/delay.h **** 
+ 109:/usr/lib/avr/include/util/delay.h ****    The macro F_CPU is supposed to be defined to a
+ 110:/usr/lib/avr/include/util/delay.h ****    constant defining the CPU clock frequency (in Hertz).
+ 111:/usr/lib/avr/include/util/delay.h **** 
+ 112:/usr/lib/avr/include/util/delay.h ****    The maximal possible delay is 262.14 ms / F_CPU in MHz.
+ 113:/usr/lib/avr/include/util/delay.h **** 
+ 114:/usr/lib/avr/include/util/delay.h ****    When the user request delay which exceed the maximum possible one,
+ 115:/usr/lib/avr/include/util/delay.h ****    _delay_ms() provides a decreased resolution functionality. In this
+ 116:/usr/lib/avr/include/util/delay.h ****    mode _delay_ms() will work with a resolution of 1/10 ms, providing
+ 117:/usr/lib/avr/include/util/delay.h ****    delays up to 6.5535 seconds (independent from CPU frequency).  The
+ 118:/usr/lib/avr/include/util/delay.h ****    user will not be informed about decreased resolution.
+ 119:/usr/lib/avr/include/util/delay.h **** 
+ 120:/usr/lib/avr/include/util/delay.h ****    If the avr-gcc toolchain has __builtin_avr_delay_cycles(unsigned long)
+ 121:/usr/lib/avr/include/util/delay.h ****    support, maximal possible delay is 4294967.295 ms/ F_CPU in MHz. For
+ 122:/usr/lib/avr/include/util/delay.h ****    values greater than the maximal possible delay, overflows results in
+ 123:/usr/lib/avr/include/util/delay.h ****    no delay i.e., 0ms.
+ 124:/usr/lib/avr/include/util/delay.h **** 
+ 125:/usr/lib/avr/include/util/delay.h ****    Conversion of __us into clock cycles may not always result in integer.
+ 126:/usr/lib/avr/include/util/delay.h ****    By default, the clock cycles rounded up to next integer. This ensures that
+ 127:/usr/lib/avr/include/util/delay.h ****    the user gets atleast __us microseconds of delay.
+ 128:/usr/lib/avr/include/util/delay.h **** 
+ 129:/usr/lib/avr/include/util/delay.h ****    Alternatively, user can define __DELAY_ROUND_DOWN__ and __DELAY_ROUND_CLOSEST__
+ 130:/usr/lib/avr/include/util/delay.h ****    to round down and round to closest integer.
+ 131:/usr/lib/avr/include/util/delay.h **** 
+ 132:/usr/lib/avr/include/util/delay.h ****    Note: The new implementation of _delay_ms(double __ms) with 
+ 133:/usr/lib/avr/include/util/delay.h ****     __builtin_avr_delay_cycles(unsigned long) support is not backward compatible. 
+ 134:/usr/lib/avr/include/util/delay.h ****    User can define __DELAY_BACKWARD_COMPATIBLE__ to get a backward compatible delay.
+ 135:/usr/lib/avr/include/util/delay.h ****    Also, the backward compatible
+ 136:/usr/lib/avr/include/util/delay.h ****    algorithm will be chosen if the code is compiled in a <em>freestanding
+ 137:/usr/lib/avr/include/util/delay.h ****    environment</em> (GCC option \c -ffreestanding), as the math functions
+ 138:/usr/lib/avr/include/util/delay.h ****    required for rounding are not available to the compiler then.
+ 139:/usr/lib/avr/include/util/delay.h **** 
+ 140:/usr/lib/avr/include/util/delay.h ****  */
+ 141:/usr/lib/avr/include/util/delay.h **** void
+ 142:/usr/lib/avr/include/util/delay.h **** _delay_ms(double __ms)
+ 143:/usr/lib/avr/include/util/delay.h **** {
+ 144:/usr/lib/avr/include/util/delay.h **** 	uint16_t __ticks;
+ 145:/usr/lib/avr/include/util/delay.h **** 	double __tmp ; 
+ 146:/usr/lib/avr/include/util/delay.h **** #if __HAS_DELAY_CYCLES && defined(__OPTIMIZE__) && \
+ 147:/usr/lib/avr/include/util/delay.h ****   !defined(__DELAY_BACKWARD_COMPATIBLE__) &&	   \
+ 148:/usr/lib/avr/include/util/delay.h ****   __STDC_HOSTED__
+ 149:/usr/lib/avr/include/util/delay.h **** 	uint32_t __ticks_dc;
+ 150:/usr/lib/avr/include/util/delay.h **** 	extern void __builtin_avr_delay_cycles(unsigned long);
+ 151:/usr/lib/avr/include/util/delay.h **** 	__tmp = ((F_CPU) / 1e3) * __ms;
+ 152:/usr/lib/avr/include/util/delay.h **** 
+ 153:/usr/lib/avr/include/util/delay.h **** 	#if defined(__DELAY_ROUND_DOWN__)
+ 154:/usr/lib/avr/include/util/delay.h **** 		__ticks_dc = (uint32_t)fabs(__tmp);
+ 155:/usr/lib/avr/include/util/delay.h **** 
+ 156:/usr/lib/avr/include/util/delay.h **** 	#elif defined(__DELAY_ROUND_CLOSEST__)
+ 157:/usr/lib/avr/include/util/delay.h **** 		__ticks_dc = (uint32_t)(fabs(__tmp)+0.5);
+ 158:/usr/lib/avr/include/util/delay.h **** 
+ 159:/usr/lib/avr/include/util/delay.h **** 	#else
+ 160:/usr/lib/avr/include/util/delay.h **** 		//round up by default
+ 161:/usr/lib/avr/include/util/delay.h **** 		__ticks_dc = (uint32_t)(ceil(fabs(__tmp)));
+ 162:/usr/lib/avr/include/util/delay.h **** 	#endif
+ 163:/usr/lib/avr/include/util/delay.h **** 
+ 164:/usr/lib/avr/include/util/delay.h **** 	__builtin_avr_delay_cycles(__ticks_dc);
+ 440               		.loc 3 164 0
+ 441 0162 E3EF      		ldi r30,lo8(499)
+ 442 0164 F1E0      		ldi r31,hi8(499)
+ 443 0166 3197      		1: sbiw r30,1
+ 444 0168 01F4      		brne 1b
+ 445 016a 00C0      		rjmp .
+ 446 016c 0000      		nop
+ 447 016e 9091 0000 		lds r25,step
+ 448 0172 4091 0000 		lds r20,vol
+ 449 0176 5091 0000 		lds r21,vol+1
+ 450 017a 6091 0000 		lds r22,vol+2
+ 451 017e 7091 0000 		lds r23,vol+3
+ 452               	.LBE18:
+ 453               	.LBE17:
+  49:main.c        **** 		_delay_ms(delay);    
+  50:main.c        **** 		if (direction == 'r')
+ 454               		.loc 2 50 0
+ 455 0182 8237      		cpi r24,lo8(114)
+ 456 0184 01F4      		brne .L25
+  51:main.c        **** 		{
+  52:main.c        **** 			if (step>=3)
+ 457               		.loc 2 52 0
+ 458 0186 9330      		cpi r25,lo8(3)
+ 459 0188 00F0      		brlo .L26
+ 460               	.LVL40:
+ 461               	.LBB19:
+ 462               	.LBB20:
+  53:main.c        **** 			{
+  54:main.c        **** 				step=0;
+ 463               		.loc 2 54 0
+ 464 018a 1092 0000 		sts step,__zero_reg__
+ 465 018e 00C0      		rjmp .L31
+ 466               	.LVL41:
+ 467               	.L26:
+ 468               	.LBE20:
+ 469               	.LBE19:
+  55:main.c        **** 				vol++;				
+  56:main.c        **** 			}
+  57:main.c        **** 			else
+  58:main.c        **** 			{
+  59:main.c        **** 				step++;
+ 470               		.loc 2 59 0
+ 471 0190 9F5F      		subi r25,lo8(-(1))
+ 472 0192 9093 0000 		sts step,r25
+ 473               	.L31:
+  60:main.c        **** 				vol++;
+ 474               		.loc 2 60 0
+ 475 0196 4F5F      		subi r20,-1
+ 476 0198 5F4F      		sbci r21,-1
+ 477 019a 6F4F      		sbci r22,-1
+ 478 019c 7F4F      		sbci r23,-1
+ 479 019e 00C0      		rjmp .L29
+ 480               	.L25:
+  61:main.c        **** 			}
+  62:main.c        **** 		}
+  63:main.c        **** 		else
+  64:main.c        **** 			{
+  65:main.c        **** 			if (step<=0)
+ 481               		.loc 2 65 0
+ 482 01a0 9111      		cpse r25,__zero_reg__
+ 483 01a2 00C0      		rjmp .L28
+  66:main.c        **** 			{
+  67:main.c        **** 				step=3;
+ 484               		.loc 2 67 0
+ 485 01a4 83E0      		ldi r24,lo8(3)
+ 486               	.LVL42:
+ 487 01a6 8093 0000 		sts step,r24
+ 488 01aa 00C0      		rjmp .L30
+ 489               	.LVL43:
+ 490               	.L28:
+  68:main.c        **** 				vol--;
+  69:main.c        **** 			}
+  70:main.c        **** 			else
+  71:main.c        **** 			{
+  72:main.c        **** 				step--;
+ 491               		.loc 2 72 0
+ 492 01ac 9150      		subi r25,lo8(-(-1))
+ 493 01ae 9093 0000 		sts step,r25
+ 494               	.LVL44:
+ 495               	.L30:
+  73:main.c        **** 				vol--;
+ 496               		.loc 2 73 0
+ 497 01b2 4150      		subi r20,1
+ 498 01b4 5109      		sbc r21,__zero_reg__
+ 499 01b6 6109      		sbc r22,__zero_reg__
+ 500 01b8 7109      		sbc r23,__zero_reg__
+ 501               	.L29:
+ 502 01ba 4093 0000 		sts vol,r20
+ 503 01be 5093 0000 		sts vol+1,r21
+ 504 01c2 6093 0000 		sts vol+2,r22
+ 505 01c6 7093 0000 		sts vol+3,r23
+ 506 01ca 0895      		ret
+ 507               		.cfi_endproc
+ 508               	.LFE14:
+ 510               	.global	automat
+ 512               	automat:
+ 513               	.LFB15:
+  74:main.c        **** 			}
+  75:main.c        **** 		}
+  76:main.c        **** 		
+  77:main.c        **** }
+  78:main.c        **** 
+  79:main.c        **** void automat (void)
+  80:main.c        **** {
+ 514               		.loc 2 80 0
+ 515               		.cfi_startproc
+ 516               	/* prologue: function */
+ 517               	/* frame size = 0 */
+ 518               	/* stack size = 0 */
+ 519               	.L__stack_usage = 0
+  81:main.c        **** if (mode == 's')
+ 520               		.loc 2 81 0
+ 521 01cc 8091 0000 		lds r24,mode
+ 522 01d0 8337      		cpi r24,lo8(115)
+ 523 01d2 01F4      		brne .+2
+ 524 01d4 00C0      		rjmp .L32
+  82:main.c        **** {
+  83:main.c        **** 	return;
+  84:main.c        **** }
+  85:main.c        **** 	
+  86:main.c        **** if ( target <= 0 )
+ 525               		.loc 2 86 0
+ 526 01d6 8091 0000 		lds r24,target
+ 527 01da 9091 0000 		lds r25,target+1
+ 528 01de A091 0000 		lds r26,target+2
+ 529 01e2 B091 0000 		lds r27,target+3
+ 530 01e6 1816      		cp __zero_reg__,r24
+ 531 01e8 1906      		cpc __zero_reg__,r25
+ 532 01ea 1A06      		cpc __zero_reg__,r26
+ 533 01ec 1B06      		cpc __zero_reg__,r27
+ 534 01ee 04F0      		brlt .L35
+  87:main.c        ****              {
+  88:main.c        **** 				 target=0;
+ 535               		.loc 2 88 0
+ 536 01f0 1092 0000 		sts target,__zero_reg__
+ 537 01f4 1092 0000 		sts target+1,__zero_reg__
+ 538 01f8 1092 0000 		sts target+2,__zero_reg__
+ 539 01fc 1092 0000 		sts target+3,__zero_reg__
+ 540               	.L35:
+  89:main.c        **** 			 }
+  90:main.c        **** if ( target >= maxsteps )
+ 541               		.loc 2 90 0
+ 542 0200 8091 0000 		lds r24,target
+ 543 0204 9091 0000 		lds r25,target+1
+ 544 0208 A091 0000 		lds r26,target+2
+ 545 020c B091 0000 		lds r27,target+3
+ 546 0210 803D      		cpi r24,-48
+ 547 0212 9740      		sbci r25,7
+ 548 0214 A105      		cpc r26,__zero_reg__
+ 549 0216 B105      		cpc r27,__zero_reg__
+ 550 0218 00F0      		brlo .L36
+  91:main.c        ****              {
+  92:main.c        **** 				 target=maxsteps;
+ 551               		.loc 2 92 0
+ 552 021a 80ED      		ldi r24,lo8(-48)
+ 553 021c 97E0      		ldi r25,lo8(7)
+ 554 021e A0E0      		ldi r26,0
+ 555 0220 B0E0      		ldi r27,0
+ 556 0222 8093 0000 		sts target,r24
+ 557 0226 9093 0000 		sts target+1,r25
+ 558 022a A093 0000 		sts target+2,r26
+ 559 022e B093 0000 		sts target+3,r27
+ 560               	.L36:
+  93:main.c        **** 			 }
+  94:main.c        **** 
+  95:main.c        **** if ( vol < target)
+ 561               		.loc 2 95 0
+ 562 0232 4091 0000 		lds r20,vol
+ 563 0236 5091 0000 		lds r21,vol+1
+ 564 023a 6091 0000 		lds r22,vol+2
+ 565 023e 7091 0000 		lds r23,vol+3
+ 566 0242 8091 0000 		lds r24,target
+ 567 0246 9091 0000 		lds r25,target+1
+ 568 024a A091 0000 		lds r26,target+2
+ 569 024e B091 0000 		lds r27,target+3
+ 570 0252 4817      		cp r20,r24
+ 571 0254 5907      		cpc r21,r25
+ 572 0256 6A07      		cpc r22,r26
+ 573 0258 7B07      		cpc r23,r27
+ 574 025a 04F4      		brge .L37
+  96:main.c        ****              {
+  97:main.c        **** 				 rotate('r');
+ 575               		.loc 2 97 0
+ 576 025c 82E7      		ldi r24,lo8(114)
+ 577 025e 00D0      		rcall rotate
+ 578               	.LVL45:
+  98:main.c        **** 				 mode='r';
+ 579               		.loc 2 98 0
+ 580 0260 82E7      		ldi r24,lo8(114)
+ 581 0262 8093 0000 		sts mode,r24
+ 582               	.L37:
+  99:main.c        **** 			 }
+ 100:main.c        **** if ( vol > target)
+ 583               		.loc 2 100 0
+ 584 0266 4091 0000 		lds r20,vol
+ 585 026a 5091 0000 		lds r21,vol+1
+ 586 026e 6091 0000 		lds r22,vol+2
+ 587 0272 7091 0000 		lds r23,vol+3
+ 588 0276 8091 0000 		lds r24,target
+ 589 027a 9091 0000 		lds r25,target+1
+ 590 027e A091 0000 		lds r26,target+2
+ 591 0282 B091 0000 		lds r27,target+3
+ 592 0286 8417      		cp r24,r20
+ 593 0288 9507      		cpc r25,r21
+ 594 028a A607      		cpc r26,r22
+ 595 028c B707      		cpc r27,r23
+ 596 028e 04F4      		brge .L38
+ 101:main.c        ****              {
+ 102:main.c        **** 				 rotate('l');
+ 597               		.loc 2 102 0
+ 598 0290 8CE6      		ldi r24,lo8(108)
+ 599 0292 00D0      		rcall rotate
+ 600               	.LVL46:
+ 103:main.c        **** 				 mode='r';
+ 601               		.loc 2 103 0
+ 602 0294 82E7      		ldi r24,lo8(114)
+ 603 0296 8093 0000 		sts mode,r24
+ 604               	.L38:
+ 104:main.c        **** 			 }
+ 105:main.c        **** if ( vol == target)
+ 605               		.loc 2 105 0
+ 606 029a 4091 0000 		lds r20,vol
+ 607 029e 5091 0000 		lds r21,vol+1
+ 608 02a2 6091 0000 		lds r22,vol+2
+ 609 02a6 7091 0000 		lds r23,vol+3
+ 610 02aa 8091 0000 		lds r24,target
+ 611 02ae 9091 0000 		lds r25,target+1
+ 612 02b2 A091 0000 		lds r26,target+2
+ 613 02b6 B091 0000 		lds r27,target+3
+ 614 02ba 4817      		cp r20,r24
+ 615 02bc 5907      		cpc r21,r25
+ 616 02be 6A07      		cpc r22,r26
+ 617 02c0 7B07      		cpc r23,r27
+ 618 02c2 01F4      		brne .L32
+ 106:main.c        ****              {
+ 107:main.c        **** 				 mode='s';
+ 619               		.loc 2 107 0
+ 620 02c4 83E7      		ldi r24,lo8(115)
+ 621 02c6 8093 0000 		sts mode,r24
+ 108:main.c        **** 				 PORTC = 0x00;
+ 622               		.loc 2 108 0
+ 623 02ca 15BA      		out 0x15,__zero_reg__
+ 624               	.L32:
+ 625 02cc 0895      		ret
+ 626               		.cfi_endproc
+ 627               	.LFE15:
+ 629               		.section	.rodata.str1.1
+ 630               	.LC1:
+ 631 000a 566F 6C3A 		.string	"Vol:"
+ 631      00
+ 632               	.LC2:
+ 633 000f 2054 6172 		.string	" Target:"
+ 633      6765 743A 
+ 633      00
+ 634               	.LC3:
+ 635 0018 0A0D 00   		.string	"\n\r"
+ 636               		.text
+ 637               	.global	echo_vol
+ 639               	echo_vol:
+ 640               	.LFB16:
+ 109:main.c        **** 			 }
+ 110:main.c        **** }
+ 111:main.c        **** 
+ 112:main.c        **** void echo_vol (void)
+ 113:main.c        **** {
+ 641               		.loc 2 113 0
+ 642               		.cfi_startproc
+ 643 02ce 8F92      		push r8
+ 644               	.LCFI17:
+ 645               		.cfi_def_cfa_offset 3
+ 646               		.cfi_offset 8, -2
+ 647 02d0 9F92      		push r9
+ 648               	.LCFI18:
+ 649               		.cfi_def_cfa_offset 4
+ 650               		.cfi_offset 9, -3
+ 651 02d2 AF92      		push r10
+ 652               	.LCFI19:
+ 653               		.cfi_def_cfa_offset 5
+ 654               		.cfi_offset 10, -4
+ 655 02d4 BF92      		push r11
+ 656               	.LCFI20:
+ 657               		.cfi_def_cfa_offset 6
+ 658               		.cfi_offset 11, -5
+ 659 02d6 CF92      		push r12
+ 660               	.LCFI21:
+ 661               		.cfi_def_cfa_offset 7
+ 662               		.cfi_offset 12, -6
+ 663 02d8 DF92      		push r13
+ 664               	.LCFI22:
+ 665               		.cfi_def_cfa_offset 8
+ 666               		.cfi_offset 13, -7
+ 667 02da EF92      		push r14
+ 668               	.LCFI23:
+ 669               		.cfi_def_cfa_offset 9
+ 670               		.cfi_offset 14, -8
+ 671 02dc FF92      		push r15
+ 672               	.LCFI24:
+ 673               		.cfi_def_cfa_offset 10
+ 674               		.cfi_offset 15, -9
+ 675               	/* prologue: function */
+ 676               	/* frame size = 0 */
+ 677               	/* stack size = 8 */
+ 678               	.L__stack_usage = 8
+ 114:main.c        **** 	tempvol=vol/FACTOR;
+ 679               		.loc 2 114 0
+ 680 02de 6091 0000 		lds r22,vol
+ 681 02e2 7091 0000 		lds r23,vol+1
+ 682 02e6 8091 0000 		lds r24,vol+2
+ 683 02ea 9091 0000 		lds r25,vol+3
+ 684 02ee 25E0      		ldi r18,lo8(5)
+ 685 02f0 822E      		mov r8,r18
+ 686 02f2 912C      		mov r9,__zero_reg__
+ 687 02f4 A12C      		mov r10,__zero_reg__
+ 688 02f6 B12C      		mov r11,__zero_reg__
+ 689 02f8 A501      		movw r20,r10
+ 690 02fa 9401      		movw r18,r8
+ 691 02fc 00D0      		rcall __divmodsi4
+ 692 02fe 6901      		movw r12,r18
+ 693 0300 7A01      		movw r14,r20
+ 694 0302 2093 0000 		sts tempvol,r18
+ 695 0306 3093 0000 		sts tempvol+1,r19
+ 696 030a 4093 0000 		sts tempvol+2,r20
+ 697 030e 5093 0000 		sts tempvol+3,r21
+ 115:main.c        **** 	temptarget=target/FACTOR;
+ 698               		.loc 2 115 0
+ 699 0312 6091 0000 		lds r22,target
+ 700 0316 7091 0000 		lds r23,target+1
+ 701 031a 8091 0000 		lds r24,target+2
+ 702 031e 9091 0000 		lds r25,target+3
+ 703 0322 A501      		movw r20,r10
+ 704 0324 9401      		movw r18,r8
+ 705 0326 00D0      		rcall __divmodsi4
+ 706 0328 2093 0000 		sts temptarget,r18
+ 707 032c 3093 0000 		sts temptarget+1,r19
+ 708 0330 4093 0000 		sts temptarget+2,r20
+ 709 0334 5093 0000 		sts temptarget+3,r21
+ 116:main.c        **** 	ltoa(tempvol,vol_str,10);
+ 710               		.loc 2 116 0
+ 711 0338 2AE0      		ldi r18,lo8(10)
+ 712 033a 30E0      		ldi r19,0
+ 713 033c 40E0      		ldi r20,lo8(vol_str)
+ 714 033e 50E0      		ldi r21,hi8(vol_str)
+ 715 0340 C701      		movw r24,r14
+ 716 0342 B601      		movw r22,r12
+ 717 0344 00D0      		rcall ltoa
+ 718               	.LVL47:
+ 117:main.c        **** 	ltoa(temptarget,target_str,10);
+ 719               		.loc 2 117 0
+ 720 0346 6091 0000 		lds r22,temptarget
+ 721 034a 7091 0000 		lds r23,temptarget+1
+ 722 034e 8091 0000 		lds r24,temptarget+2
+ 723 0352 9091 0000 		lds r25,temptarget+3
+ 724 0356 2AE0      		ldi r18,lo8(10)
+ 725 0358 30E0      		ldi r19,0
+ 726 035a 40E0      		ldi r20,lo8(target_str)
+ 727 035c 50E0      		ldi r21,hi8(target_str)
+ 728 035e 00D0      		rcall ltoa
+ 729               	.LVL48:
+ 118:main.c        **** 	uart_puts("Vol:");
+ 730               		.loc 2 118 0
+ 731 0360 80E0      		ldi r24,lo8(.LC1)
+ 732 0362 90E0      		ldi r25,hi8(.LC1)
+ 733 0364 00D0      		rcall uart_puts
+ 734               	.LVL49:
+ 119:main.c        **** 	uart_puts(vol_str);
+ 735               		.loc 2 119 0
+ 736 0366 80E0      		ldi r24,lo8(vol_str)
+ 737 0368 90E0      		ldi r25,hi8(vol_str)
+ 738 036a 00D0      		rcall uart_puts
+ 739               	.LVL50:
+ 120:main.c        **** 	uart_puts(" Target:");
+ 740               		.loc 2 120 0
+ 741 036c 80E0      		ldi r24,lo8(.LC2)
+ 742 036e 90E0      		ldi r25,hi8(.LC2)
+ 743 0370 00D0      		rcall uart_puts
+ 744               	.LVL51:
+ 121:main.c        **** 	uart_puts(target_str);
+ 745               		.loc 2 121 0
+ 746 0372 80E0      		ldi r24,lo8(target_str)
+ 747 0374 90E0      		ldi r25,hi8(target_str)
+ 748 0376 00D0      		rcall uart_puts
+ 749               	.LVL52:
+ 122:main.c        **** 	uart_puts("\n\r");
+ 750               		.loc 2 122 0
+ 751 0378 80E0      		ldi r24,lo8(.LC3)
+ 752 037a 90E0      		ldi r25,hi8(.LC3)
+ 753               	/* epilogue start */
+ 123:main.c        **** }
+ 754               		.loc 2 123 0
+ 755 037c FF90      		pop r15
+ 756 037e EF90      		pop r14
+ 757 0380 DF90      		pop r13
+ 758 0382 CF90      		pop r12
+ 759 0384 BF90      		pop r11
+ 760 0386 AF90      		pop r10
+ 761 0388 9F90      		pop r9
+ 762 038a 8F90      		pop r8
+ 122:main.c        **** 	uart_puts("\n\r");
+ 763               		.loc 2 122 0
+ 764 038c 00C0      		rjmp uart_puts
+ 765               	.LVL53:
+ 766               		.cfi_endproc
+ 767               	.LFE16:
+ 769               		.section	.rodata.str1.1
+ 770               	.LC4:
+ 771 001b 4E65 7720 		.string	"New Target:\n\r"
+ 771      5461 7267 
+ 771      6574 3A0A 
+ 771      0D00 
+ 772               		.section	.text.startup,"ax",@progbits
+ 773               	.global	main
+ 775               	main:
+ 776               	.LFB17:
+ 124:main.c        **** 
+ 125:main.c        **** int main(void)
+ 126:main.c        **** {
+ 777               		.loc 2 126 0
+ 778               		.cfi_startproc
+ 779               	/* prologue: function */
+ 780               	/* frame size = 0 */
+ 781               	/* stack size = 0 */
+ 782               	.L__stack_usage = 0
+ 127:main.c        ****     unsigned int c;
+ 128:main.c        **** 
+ 129:main.c        ****     
+ 130:main.c        ****     /*
+ 131:main.c        ****      *  Initialize UART library, pass baudrate and AVR cpu clock
+ 132:main.c        ****      *  with the macro 
+ 133:main.c        ****      *  UART_BAUD_SELECT() (normal speed mode )
+ 134:main.c        ****      *  or 
+ 135:main.c        ****      *  UART_BAUD_SELECT_DOUBLE_SPEED() ( double speed mode)
+ 136:main.c        ****      */
+ 137:main.c        ****     uart_init( UART_BAUD_SELECT(UART_BAUD_RATE,F_CPU) ); 
+ 783               		.loc 2 137 0
+ 784 0000 83E3      		ldi r24,lo8(51)
+ 785 0002 90E0      		ldi r25,0
+ 786 0004 00D0      		rcall uart_init
+ 787               	.LVL54:
+ 138:main.c        ****     
+ 139:main.c        ****     DDRC = 0xff;                  /* Enable output on all of the B pins */  
+ 788               		.loc 2 139 0
+ 789 0006 8FEF      		ldi r24,lo8(-1)
+ 790 0008 84BB      		out 0x14,r24
+ 140:main.c        ****     PORTC = 0x00;                 /* Set them all to 0v */
+ 791               		.loc 2 140 0
+ 792 000a 15BA      		out 0x15,__zero_reg__
+ 141:main.c        ****     
+ 142:main.c        ****     /*
+ 143:main.c        ****      * now enable interrupt, since UART library is interrupt controlled
+ 144:main.c        ****      */
+ 145:main.c        ****     sei();
+ 793               		.loc 2 145 0
+ 794               	/* #APP */
+ 795               	 ;  145 "main.c" 1
+ 796 000c 7894      		sei
+ 797               	 ;  0 "" 2
+ 146:main.c        ****     uart_putc('\n');
+ 798               		.loc 2 146 0
+ 799               	/* #NOAPP */
+ 800 000e 8AE0      		ldi r24,lo8(10)
+ 801 0010 00D0      		rcall uart_putc
+ 802               	.LVL55:
+ 147:main.c        ****     uart_putc('\r');
+ 803               		.loc 2 147 0
+ 804 0012 8DE0      		ldi r24,lo8(13)
+ 805 0014 00D0      		rcall uart_putc
+ 806               	.LVL56:
+ 148:main.c        **** 	
+ 149:main.c        **** 	echo_vol();
+ 807               		.loc 2 149 0
+ 808 0016 00D0      		rcall echo_vol
+ 809               	.LVL57:
+ 150:main.c        ****     
+ 151:main.c        ****     for(;;)
+ 152:main.c        ****     {
+ 153:main.c        **** 		
+ 154:main.c        ****         /*
+ 155:main.c        ****          * Get received character from ringbuffer
+ 156:main.c        ****          * uart_getc() returns in the lower byte the received character and 
+ 157:main.c        ****          * in the higher byte (bitmask) the last receive error
+ 158:main.c        ****          * UART_NO_DATA is returned when no data is available.
+ 159:main.c        ****          *
+ 160:main.c        ****          */
+ 161:main.c        ****         c = uart_getc();
+ 162:main.c        ****         if ( c & UART_NO_DATA )
+ 163:main.c        ****         {
+ 164:main.c        ****             /* 
+ 165:main.c        ****              * no data available from UART 
+ 166:main.c        ****              */
+ 167:main.c        ****              //if ( mode == 'r' ){
+ 168:main.c        ****              //rotate(last_direction);
+ 169:main.c        ****              cli();
+ 170:main.c        ****              automat();
+ 171:main.c        ****              sei();
+ 172:main.c        **** 			//}
+ 173:main.c        ****         }
+ 174:main.c        ****         else
+ 175:main.c        **** 		{
+ 176:main.c        **** 			switch (c) {
+ 177:main.c        **** 				case 'r':
+ 178:main.c        **** 					uart_puts_P("RIGHT\n\r");
+ 179:main.c        **** 					target=target+tsteps;
+ 180:main.c        **** 					last_direction = 'r';
+ 181:main.c        **** 					mode = 'r';
+ 182:main.c        **** 					//rotate('r');
+ 183:main.c        **** 					break;
+ 184:main.c        **** 				case 'l':
+ 185:main.c        **** 					uart_puts_P("LEFT\n\r");
+ 186:main.c        **** 					target=target-tsteps;
+ 187:main.c        **** 					last_direction = 'l';
+ 810               		.loc 2 187 0
+ 811 0018 DCE6      		ldi r29,lo8(108)
+ 188:main.c        **** 					mode = 'r';
+ 812               		.loc 2 188 0
+ 813 001a C2E7      		ldi r28,lo8(114)
+ 189:main.c        **** 					//rotate('l');
+ 190:main.c        **** 					break;
+ 191:main.c        **** 				case 's':
+ 192:main.c        **** 					uart_puts_P("STOP\n\r");
+ 193:main.c        **** 					mode = 's';
+ 814               		.loc 2 193 0
+ 815 001c 13E7      		ldi r17,lo8(115)
+ 194:main.c        **** 					PORTC = 0x00;
+ 195:main.c        **** 					break;
+ 196:main.c        **** 				case 'c':
+ 197:main.c        **** 					uart_puts_P("CALIBRATE\n\r");
+ 198:main.c        **** 					vol = 0;
+ 199:main.c        **** 					target=0;
+ 200:main.c        **** 					break;
+ 201:main.c        **** 				case 'i':
+ 202:main.c        **** 					echo_vol();
+ 203:main.c        **** 					break;
+ 204:main.c        **** 				case 't':
+ 205:main.c        **** 					uart_puts_P("Target\n\r");
+ 206:main.c        **** 					mode = 'r';
+ 207:main.c        **** 					while (1)
+ 208:main.c        **** 					{
+ 209:main.c        **** 						c = uart_getc();
+ 210:main.c        **** 						if (~ c & UART_NO_DATA )
+ 211:main.c        **** 						{
+ 212:main.c        **** 							target = (unsigned int) c * FACTOR;
+ 816               		.loc 2 212 0
+ 817 001e 05E0      		ldi r16,lo8(5)
+ 818               	.L42:
+ 161:main.c        ****         c = uart_getc();
+ 819               		.loc 2 161 0
+ 820 0020 00D0      		rcall uart_getc
+ 821               	.LVL58:
+ 162:main.c        ****         if ( c & UART_NO_DATA )
+ 822               		.loc 2 162 0
+ 823 0022 90FF      		sbrs r25,0
+ 824 0024 00C0      		rjmp .L43
+ 169:main.c        ****              cli();
+ 825               		.loc 2 169 0
+ 826               	/* #APP */
+ 827               	 ;  169 "main.c" 1
+ 828 0026 F894      		cli
+ 829               	 ;  0 "" 2
+ 170:main.c        ****              automat();
+ 830               		.loc 2 170 0
+ 831               	/* #NOAPP */
+ 832 0028 00D0      		rcall automat
+ 833               	.LVL59:
+ 171:main.c        ****              sei();
+ 834               		.loc 2 171 0
+ 835               	/* #APP */
+ 836               	 ;  171 "main.c" 1
+ 837 002a 7894      		sei
+ 838               	 ;  0 "" 2
+ 839               	/* #NOAPP */
+ 840 002c 00C0      		rjmp .L42
+ 841               	.LVL60:
+ 842               	.L43:
+ 176:main.c        **** 			switch (c) {
+ 843               		.loc 2 176 0
+ 844 002e 8C36      		cpi r24,108
+ 845 0030 9105      		cpc r25,__zero_reg__
+ 846 0032 01F0      		breq .L46
+ 847 0034 00F4      		brsh .L47
+ 848 0036 8336      		cpi r24,99
+ 849 0038 9105      		cpc r25,__zero_reg__
+ 850 003a 01F4      		brne .+2
+ 851 003c 00C0      		rjmp .L48
+ 852 003e 8936      		cpi r24,105
+ 853 0040 9105      		cpc r25,__zero_reg__
+ 854 0042 01F4      		brne .+2
+ 855 0044 00C0      		rjmp .L55
+ 856 0046 00C0      		rjmp .L45
+ 857               	.L47:
+ 858 0048 8337      		cpi r24,115
+ 859 004a 9105      		cpc r25,__zero_reg__
+ 860 004c 01F0      		breq .L50
+ 861 004e 8437      		cpi r24,116
+ 862 0050 9105      		cpc r25,__zero_reg__
+ 863 0052 01F4      		brne .+2
+ 864 0054 00C0      		rjmp .L51
+ 865 0056 8237      		cpi r24,114
+ 866 0058 9105      		cpc r25,__zero_reg__
+ 867 005a 01F0      		breq .+2
+ 868 005c 00C0      		rjmp .L45
+ 178:main.c        **** 					uart_puts_P("RIGHT\n\r");
+ 869               		.loc 2 178 0
+ 870 005e 80E0      		ldi r24,lo8(__c.2192)
+ 871 0060 90E0      		ldi r25,hi8(__c.2192)
+ 872               	.LVL61:
+ 873 0062 00D0      		rcall uart_puts_p
+ 874               	.LVL62:
+ 179:main.c        **** 					target=target+tsteps;
+ 875               		.loc 2 179 0
+ 876 0064 8091 0000 		lds r24,target
+ 877 0068 9091 0000 		lds r25,target+1
+ 878 006c A091 0000 		lds r26,target+2
+ 879 0070 B091 0000 		lds r27,target+3
+ 880 0074 8C50      		subi r24,12
+ 881 0076 9E4F      		sbci r25,-2
+ 882 0078 AF4F      		sbci r26,-1
+ 883 007a BF4F      		sbci r27,-1
+ 884 007c 8093 0000 		sts target,r24
+ 885 0080 9093 0000 		sts target+1,r25
+ 886 0084 A093 0000 		sts target+2,r26
+ 887 0088 B093 0000 		sts target+3,r27
+ 180:main.c        **** 					last_direction = 'r';
+ 888               		.loc 2 180 0
+ 889 008c C093 0000 		sts last_direction,r28
+ 890 0090 00C0      		rjmp .L56
+ 891               	.LVL63:
+ 892               	.L46:
+ 185:main.c        **** 					uart_puts_P("LEFT\n\r");
+ 893               		.loc 2 185 0
+ 894 0092 80E0      		ldi r24,lo8(__c.2196)
+ 895 0094 90E0      		ldi r25,hi8(__c.2196)
+ 896               	.LVL64:
+ 897 0096 00D0      		rcall uart_puts_p
+ 898               	.LVL65:
+ 186:main.c        **** 					target=target-tsteps;
+ 899               		.loc 2 186 0
+ 900 0098 8091 0000 		lds r24,target
+ 901 009c 9091 0000 		lds r25,target+1
+ 902 00a0 A091 0000 		lds r26,target+2
+ 903 00a4 B091 0000 		lds r27,target+3
+ 904 00a8 845F      		subi r24,-12
+ 905 00aa 9140      		sbci r25,1
+ 906 00ac A109      		sbc r26,__zero_reg__
+ 907 00ae B109      		sbc r27,__zero_reg__
+ 908 00b0 8093 0000 		sts target,r24
+ 909 00b4 9093 0000 		sts target+1,r25
+ 910 00b8 A093 0000 		sts target+2,r26
+ 911 00bc B093 0000 		sts target+3,r27
+ 187:main.c        **** 					last_direction = 'l';
+ 912               		.loc 2 187 0
+ 913 00c0 D093 0000 		sts last_direction,r29
+ 914               	.L56:
+ 188:main.c        **** 					mode = 'r';
+ 915               		.loc 2 188 0
+ 916 00c4 C093 0000 		sts mode,r28
+ 190:main.c        **** 					break;
+ 917               		.loc 2 190 0
+ 918 00c8 00C0      		rjmp .L42
+ 919               	.LVL66:
+ 920               	.L50:
+ 192:main.c        **** 					uart_puts_P("STOP\n\r");
+ 921               		.loc 2 192 0
+ 922 00ca 80E0      		ldi r24,lo8(__c.2199)
+ 923 00cc 90E0      		ldi r25,hi8(__c.2199)
+ 924               	.LVL67:
+ 925 00ce 00D0      		rcall uart_puts_p
+ 926               	.LVL68:
+ 193:main.c        **** 					mode = 's';
+ 927               		.loc 2 193 0
+ 928 00d0 1093 0000 		sts mode,r17
+ 194:main.c        **** 					PORTC = 0x00;
+ 929               		.loc 2 194 0
+ 930 00d4 15BA      		out 0x15,__zero_reg__
+ 195:main.c        **** 					break;
+ 931               		.loc 2 195 0
+ 932 00d6 00C0      		rjmp .L42
+ 933               	.LVL69:
+ 934               	.L48:
+ 197:main.c        **** 					uart_puts_P("CALIBRATE\n\r");
+ 935               		.loc 2 197 0
+ 936 00d8 80E0      		ldi r24,lo8(__c.2202)
+ 937 00da 90E0      		ldi r25,hi8(__c.2202)
+ 938               	.LVL70:
+ 939 00dc 00D0      		rcall uart_puts_p
+ 940               	.LVL71:
+ 198:main.c        **** 					vol = 0;
+ 941               		.loc 2 198 0
+ 942 00de 1092 0000 		sts vol,__zero_reg__
+ 943 00e2 1092 0000 		sts vol+1,__zero_reg__
+ 944 00e6 1092 0000 		sts vol+2,__zero_reg__
+ 945 00ea 1092 0000 		sts vol+3,__zero_reg__
+ 199:main.c        **** 					target=0;
+ 946               		.loc 2 199 0
+ 947 00ee 1092 0000 		sts target,__zero_reg__
+ 948 00f2 1092 0000 		sts target+1,__zero_reg__
+ 949 00f6 1092 0000 		sts target+2,__zero_reg__
+ 950 00fa 1092 0000 		sts target+3,__zero_reg__
+ 200:main.c        **** 					break;
+ 951               		.loc 2 200 0
+ 952 00fe 00C0      		rjmp .L42
+ 953               	.LVL72:
+ 954               	.L51:
+ 205:main.c        **** 					uart_puts_P("Target\n\r");
+ 955               		.loc 2 205 0
+ 956 0100 80E0      		ldi r24,lo8(__c.2206)
+ 957 0102 90E0      		ldi r25,hi8(__c.2206)
+ 958               	.LVL73:
+ 959 0104 00D0      		rcall uart_puts_p
+ 960               	.LVL74:
+ 206:main.c        **** 					mode = 'r';
+ 961               		.loc 2 206 0
+ 962 0106 C093 0000 		sts mode,r28
+ 963               	.L54:
+ 209:main.c        **** 						c = uart_getc();
+ 964               		.loc 2 209 0
+ 965 010a 00D0      		rcall uart_getc
+ 966               	.LVL75:
+ 210:main.c        **** 						if (~ c & UART_NO_DATA )
+ 967               		.loc 2 210 0
+ 968 010c 90FD      		sbrc r25,0
+ 969 010e 00C0      		rjmp .L54
+ 970               		.loc 2 212 0
+ 971 0110 089F      		mul r16,r24
+ 972 0112 B001      		movw r22,r0
+ 973 0114 099F      		mul r16,r25
+ 974 0116 700D      		add r23,r0
+ 975 0118 1124      		clr __zero_reg__
+ 976 011a 80E0      		ldi r24,0
+ 977 011c 90E0      		ldi r25,0
+ 978               	.LVL76:
+ 979 011e 6093 0000 		sts target,r22
+ 980 0122 7093 0000 		sts target+1,r23
+ 981 0126 8093 0000 		sts target+2,r24
+ 982 012a 9093 0000 		sts target+3,r25
+ 213:main.c        **** 							break;
+ 214:main.c        **** 						}
+ 215:main.c        **** 					}
+ 216:main.c        **** 					ltoa(target, target_str, 10);
+ 983               		.loc 2 216 0
+ 984 012e 2AE0      		ldi r18,lo8(10)
+ 985 0130 30E0      		ldi r19,0
+ 986 0132 40E0      		ldi r20,lo8(target_str)
+ 987 0134 50E0      		ldi r21,hi8(target_str)
+ 988 0136 00D0      		rcall ltoa
+ 989               	.LVL77:
+ 217:main.c        **** 					uart_puts("New Target:\n\r");
+ 990               		.loc 2 217 0
+ 991 0138 80E0      		ldi r24,lo8(.LC4)
+ 992 013a 90E0      		ldi r25,hi8(.LC4)
+ 993 013c 00D0      		rcall uart_puts
+ 994               	.LVL78:
+ 218:main.c        **** 					uart_puts(target_str);
+ 995               		.loc 2 218 0
+ 996 013e 80E0      		ldi r24,lo8(target_str)
+ 997 0140 90E0      		ldi r25,hi8(target_str)
+ 998 0142 00D0      		rcall uart_puts
+ 999               	.LVL79:
+ 219:main.c        **** 					uart_puts("\n\r");					
+ 1000               		.loc 2 219 0
+ 1001 0144 80E0      		ldi r24,lo8(.LC3)
+ 1002 0146 90E0      		ldi r25,hi8(.LC3)
+ 1003 0148 00D0      		rcall uart_puts
+ 1004               	.LVL80:
+ 220:main.c        **** 					break;
+ 1005               		.loc 2 220 0
+ 1006 014a 00C0      		rjmp .L42
+ 1007               	.LVL81:
+ 1008               	.L45:
+ 221:main.c        **** 				default:
+ 222:main.c        **** 					uart_puts_P("\n\rr - Right\n\rl - Left\n\rs - stop\n\rc - Calibrate\n\rt - Target\n\ri - Info\
+ 1009               		.loc 2 222 0
+ 1010 014c 80E0      		ldi r24,lo8(__c.2211)
+ 1011 014e 90E0      		ldi r25,hi8(__c.2211)
+ 1012               	.LVL82:
+ 1013 0150 00D0      		rcall uart_puts_p
+ 1014               	.LVL83:
+ 1015               	.L55:
+ 223:main.c        **** 					echo_vol();
+ 1016               		.loc 2 223 0
+ 1017 0152 00D0      		rcall echo_vol
+ 1018               	.LVL84:
+ 224:main.c        **** 					break;
+ 1019               		.loc 2 224 0
+ 1020 0154 00C0      		rjmp .L42
+ 1021               		.cfi_endproc
+ 1022               	.LFE17:
+ 1024               		.section	.progmem.data,"a",@progbits
+ 1027               	__c.2211:
+ 1028 0000 0A0D 7220 		.string	"\n\rr - Right\n\rl - Left\n\rs - stop\n\rc - Calibrate\n\rt - Target\n\ri - Info\n\r"
+ 1028      2D20 5269 
+ 1028      6768 740A 
+ 1028      0D6C 202D 
+ 1028      204C 6566 
+ 1031               	__c.2206:
+ 1032 0047 5461 7267 		.string	"Target\n\r"
+ 1032      6574 0A0D 
+ 1032      00
+ 1035               	__c.2202:
+ 1036 0050 4341 4C49 		.string	"CALIBRATE\n\r"
+ 1036      4252 4154 
+ 1036      450A 0D00 
+ 1039               	__c.2199:
+ 1040 005c 5354 4F50 		.string	"STOP\n\r"
+ 1040      0A0D 00
+ 1043               	__c.2196:
+ 1044 0063 4C45 4654 		.string	"LEFT\n\r"
+ 1044      0A0D 00
+ 1047               	__c.2192:
+ 1048 006a 5249 4748 		.string	"RIGHT\n\r"
+ 1048      540A 0D00 
+ 1049               	.global	clockwise
+ 1050               		.section	.rodata
+ 1053               	clockwise:
+ 1054 0000 20        		.byte	32
+ 1055 0001 10        		.byte	16
+ 1056 0002 08        		.byte	8
+ 1057 0003 04        		.byte	4
+ 1058               	.global	i
+ 1059               		.section .bss
+ 1062               	i:
+ 1063 0000 00        		.zero	1
+ 1064               	.global	mode
+ 1065               		.data
+ 1068               	mode:
+ 1069 0000 73        		.byte	115
+ 1070               	.global	last_direction
+ 1073               	last_direction:
+ 1074 0001 72        		.byte	114
+ 1075               	.global	FACTOR
+ 1076               		.section	.rodata
+ 1079               	FACTOR:
+ 1080 0004 0500      		.word	5
+ 1081               	.global	maxsteps
+ 1084               	maxsteps:
+ 1085 0006 D0        		.byte	-48
+ 1086 0007 07        		.byte	7
+ 1087 0008 00        		.byte	0
+ 1088 0009 00        		.byte	0
+ 1089               	.global	tsteps
+ 1092               	tsteps:
+ 1093 000a F4        		.byte	-12
+ 1094 000b 01        		.byte	1
+ 1095 000c 00        		.byte	0
+ 1096 000d 00        		.byte	0
+ 1097               	.global	step
+ 1098               		.section .bss
+ 1101               	step:
+ 1102 0001 00        		.zero	1
+ 1103               	.global	delay
+ 1104               		.section	.rodata
+ 1107               	delay:
+ 1108 000e 02        		.byte	2
+ 1109               		.comm	temptarget,4,1
+ 1110               		.comm	tempvol,4,1
+ 1111               		.comm	target_str,50,1
+ 1112               	.global	target
+ 1113               		.section .bss
+ 1116               	target:
+ 1117 0002 0000 0000 		.zero	4
+ 1118               		.comm	vol_str,50,1
+ 1119               	.global	vol
+ 1122               	vol:
+ 1123 0006 0000 0000 		.zero	4
+ 1124               		.comm	three,1,1
+ 1125               		.comm	two,1,1
+ 1126               		.comm	one,1,1
+ 1127               		.local	UART_LastRxError
+ 1128               		.comm	UART_LastRxError,1,1
+ 1129               		.local	UART_RxTail
+ 1130               		.comm	UART_RxTail,1,1
+ 1131               		.local	UART_RxHead
+ 1132               		.comm	UART_RxHead,1,1
+ 1133               		.local	UART_TxTail
+ 1134               		.comm	UART_TxTail,1,1
+ 1135               		.local	UART_TxHead
+ 1136               		.comm	UART_TxHead,1,1
+ 1137               		.local	UART_RxBuf
+ 1138               		.comm	UART_RxBuf,32,1
+ 1139               		.local	UART_TxBuf
+ 1140               		.comm	UART_TxBuf,32,1
+ 1141               		.text
+ 1142               	.Letext0:
+ 1143               		.file 4 "/usr/lib/avr/include/stdint.h"
+ 1144               		.file 5 "/usr/lib/avr/include/stdlib.h"
+DEFINED SYMBOLS
+                            *ABS*:0000000000000000 main.c
+     /tmp/cc0m3eJj.s:2      *ABS*:000000000000003e __SP_H__
+     /tmp/cc0m3eJj.s:3      *ABS*:000000000000003d __SP_L__
+     /tmp/cc0m3eJj.s:4      *ABS*:000000000000003f __SREG__
+     /tmp/cc0m3eJj.s:5      *ABS*:0000000000000000 __tmp_reg__
+     /tmp/cc0m3eJj.s:6      *ABS*:0000000000000001 __zero_reg__
+     /tmp/cc0m3eJj.s:12     .text:0000000000000000 __vector_11
+     /tmp/cc0m3eJj.s:1130   .bss:000000000000000c UART_RxHead
+     /tmp/cc0m3eJj.s:1128   .bss:000000000000000b UART_RxTail
+     /tmp/cc0m3eJj.s:1136   .bss:000000000000000f UART_RxBuf
+                             .bss:000000000000000a UART_LastRxError
+     /tmp/cc0m3eJj.s:109    .text:0000000000000058 __vector_12
+     /tmp/cc0m3eJj.s:1134   .bss:000000000000000e UART_TxHead
+     /tmp/cc0m3eJj.s:1132   .bss:000000000000000d UART_TxTail
+     /tmp/cc0m3eJj.s:1138   .bss:000000000000002f UART_TxBuf
+     /tmp/cc0m3eJj.s:185    .text:00000000000000a2 uart_getc
+     /tmp/cc0m3eJj.s:236    .text:00000000000000d4 uart_putc
+     /tmp/cc0m3eJj.s:271    .text:00000000000000f6 uart_puts
+     /tmp/cc0m3eJj.s:318    .text:000000000000010c uart_init
+     /tmp/cc0m3eJj.s:366    .text:0000000000000138 uart_puts_p
+     /tmp/cc0m3eJj.s:419    .text:0000000000000154 rotate
+     /tmp/cc0m3eJj.s:1101   .bss:0000000000000001 step
+     /tmp/cc0m3eJj.s:1053   .rodata:0000000000000000 clockwise
+     /tmp/cc0m3eJj.s:1122   .bss:0000000000000006 vol
+     /tmp/cc0m3eJj.s:512    .text:00000000000001cc automat
+     /tmp/cc0m3eJj.s:1068   .data:0000000000000000 mode
+     /tmp/cc0m3eJj.s:1116   .bss:0000000000000002 target
+     /tmp/cc0m3eJj.s:639    .text:00000000000002ce echo_vol
+                            *COM*:0000000000000004 tempvol
+                            *COM*:0000000000000004 temptarget
+                            *COM*:0000000000000032 vol_str
+                            *COM*:0000000000000032 target_str
+     /tmp/cc0m3eJj.s:775    .text.startup:0000000000000000 main
+     /tmp/cc0m3eJj.s:1047   .progmem.data:000000000000006a __c.2192
+     /tmp/cc0m3eJj.s:1073   .data:0000000000000001 last_direction
+     /tmp/cc0m3eJj.s:1043   .progmem.data:0000000000000063 __c.2196
+     /tmp/cc0m3eJj.s:1039   .progmem.data:000000000000005c __c.2199
+     /tmp/cc0m3eJj.s:1035   .progmem.data:0000000000000050 __c.2202
+     /tmp/cc0m3eJj.s:1031   .progmem.data:0000000000000047 __c.2206
+     /tmp/cc0m3eJj.s:1027   .progmem.data:0000000000000000 __c.2211
+     /tmp/cc0m3eJj.s:1062   .bss:0000000000000000 i
+     /tmp/cc0m3eJj.s:1079   .rodata:0000000000000004 FACTOR
+     /tmp/cc0m3eJj.s:1084   .rodata:0000000000000006 maxsteps
+     /tmp/cc0m3eJj.s:1092   .rodata:000000000000000a tsteps
+     /tmp/cc0m3eJj.s:1107   .rodata:000000000000000e delay
+                            *COM*:0000000000000001 three
+                            *COM*:0000000000000001 two
+                            *COM*:0000000000000001 one
+
+UNDEFINED SYMBOLS
+__divmodsi4
+ltoa
+__do_copy_data
+__do_clear_bss

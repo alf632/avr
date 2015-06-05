@@ -1,0 +1,20 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 11.00
+# AvrStudio Solution File, Format Version 11.00
+Project("{D1100916-62DA-4D80-A9B4-55A1E7CCEEB3}") = "button", "button\button.avrgccproj", "{BCFD3886-E053-4B88-B267-9C1266909A11}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|AVR = Debug|AVR
+		Release|AVR = Release|AVR
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BCFD3886-E053-4B88-B267-9C1266909A11}.Debug|AVR.ActiveCfg = Debug|AVR
+		{BCFD3886-E053-4B88-B267-9C1266909A11}.Debug|AVR.Build.0 = Debug|AVR
+		{BCFD3886-E053-4B88-B267-9C1266909A11}.Release|AVR.ActiveCfg = Release|AVR
+		{BCFD3886-E053-4B88-B267-9C1266909A11}.Release|AVR.Build.0 = Release|AVR
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
